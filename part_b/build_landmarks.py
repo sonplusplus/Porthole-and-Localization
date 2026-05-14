@@ -1,13 +1,15 @@
 import argparse
 import json
+import math
+import warnings
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-from .phase3_kitti import KittiRawSequence, discover_kitti_sequences
-from .phase3_schema import Pose2D
-from .phase4_detector import Phase4LandmarkDetector
-from .phase4_landmark_db import LandmarkDatabase
-from .phase4_ocr import create_ocr_backend
+from .kitti import KittiRawSequence, discover_kitti_sequences
+from .schema import Pose2D
+from .detector import Phase4LandmarkDetector
+from .landmark_db import LandmarkDatabase
+from .ocr import create_ocr_backend
 
 
 def build_landmark_db(
@@ -18,6 +20,7 @@ def build_landmark_db(
     camera: str = "image_02",
     max_frames: Optional[int] = None,
     ocr_lang: str = "vi",
+    depth_onnx_path: Optional[str] = None,
 ) -> None:
     seq = KittiRawSequence(sync_path=sync_path, calib_path=calib_path, camera=camera)
     phase3_rows = _load_phase3_pose_rows(phase3_output) if phase3_output else {}
@@ -27,6 +30,7 @@ def build_landmark_db(
         camera_cx=seq.camera_params.cx,
         ocr=ocr,
     )
+    depth_estimator = _create_depth_estimator(depth_onnx_path, seq.camera_params)
     db = LandmarkDatabase(sequence_id=seq.sequence_id)
 
     out_path = Path(output)
@@ -40,11 +44,18 @@ def build_landmark_db(
     class_counts: Dict[str, int] = {}
 
     try:
+        prev_xy: Optional[Tuple[float, float]] = None
+        prev_theta = 0.0
         with observations_path.open("w", encoding="utf-8") as obs_file:
             for sample in seq.iter_samples(max_frames=max_frames):
                 pose = phase3_rows.get(sample.meta.frame_index)
                 if pose is None:
-                    pose = _pose_from_sample_xy(sample.local_xy)
+                    pose = _pose_from_sample_xy(sample.local_xy, prev_xy=prev_xy, prev_theta=prev_theta)
+                prev_theta = pose.theta
+
+                depth_metric = None
+                if depth_estimator is not None:
+                    depth_metric = depth_estimator.infer_metric(sample.frame)
 
                 detected = detector.detect(
                     frame=sample.frame,
@@ -52,7 +63,10 @@ def build_landmark_db(
                     sequence_id=seq.sequence_id,
                     frame_index=sample.meta.frame_index,
                     timestamp=sample.meta.timestamp,
+                    depth_metric=depth_metric,
                 )
+                if sample.local_xy is not None:
+                    prev_xy = sample.local_xy
                 frames += 1
                 for obs in detected:
                     record, match = db.upsert(obs)
@@ -97,6 +111,8 @@ def build_landmark_db(
         "observations_output": str(observations_path),
         "ocr_backend": ocr.name,
         "ocr_lang": getattr(ocr, "lang", ocr_lang),
+        "depth_model": depth_onnx_path,
+        "depth_enabled": depth_estimator is not None,
     }
     summary_path = out_path.with_suffix(out_path.suffix + ".summary.json")
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -130,10 +146,43 @@ def _load_phase3_pose_rows(path: Optional[str]) -> Dict[int, Pose2D]:
     return rows
 
 
-def _pose_from_sample_xy(local_xy) -> Pose2D:
+def _create_depth_estimator(depth_onnx_path: Optional[str], camera_params):
+    if not depth_onnx_path:
+        return None
+
+    path = Path(depth_onnx_path)
+    if not path.exists():
+        warnings.warn(
+            f"Depth model not found for landmark depth inference: {path}. "
+            "Falling back to assumed landmark distances.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+
+    from part_a.depth import DepthEstimator
+
+    return DepthEstimator(str(path), camera_params)
+
+
+def _pose_from_sample_xy(
+    local_xy,
+    prev_xy: Optional[Tuple[float, float]] = None,
+    prev_theta: float = 0.0,
+) -> Pose2D:
     if local_xy is None:
-        return Pose2D(x=0.0, y=0.0, theta=0.0)
-    return Pose2D(x=float(local_xy[0]), y=float(local_xy[1]), theta=0.0)
+        return Pose2D(x=0.0, y=0.0, theta=prev_theta)
+
+    x, y = float(local_xy[0]), float(local_xy[1])
+    theta = prev_theta
+    if prev_xy is not None:
+        dx = x - float(prev_xy[0])
+        dy = y - float(prev_xy[1])
+        dist = math.hypot(dx, dy)
+        if dist > 0.5:
+            theta = math.atan2(dy, dx)
+
+    return Pose2D(x=x, y=y, theta=theta)
 
 
 def resolve_sequence(args: argparse.Namespace):
@@ -165,6 +214,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", default="image_02", choices=["image_02", "image_03"])
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--ocr-lang", default="vi", help="PaddleOCR language code, default Vietnamese")
+    parser.add_argument("--depth", default=None, help="Optional Depth Anything ONNX model for landmark distance")
     parser.add_argument("--output", default=None, help="Output landmark JSONL path")
     return parser.parse_args()
 
@@ -182,6 +232,7 @@ def main() -> None:
         camera=args.camera,
         max_frames=args.max_frames,
         ocr_lang=args.ocr_lang,
+        depth_onnx_path=args.depth,
     )
 
 

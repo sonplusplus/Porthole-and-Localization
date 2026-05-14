@@ -5,9 +5,9 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .phase3_schema import Pose2D
-from .phase4_landmark_schema import LandmarkObservation, Point3D, VisualDescriptor, normalize_text
-from .phase4_ocr import OcrBackend
+from .schema import Pose2D
+from .landmark_schema import LandmarkObservation, Point3D, VisualDescriptor, normalize_text
+from .ocr import OcrBackend
 
 
 @dataclass
@@ -47,6 +47,7 @@ class Phase4LandmarkDetector:
         sequence_id: str,
         frame_index: int,
         timestamp: float,
+        depth_metric: Optional[np.ndarray] = None,
     ) -> List[LandmarkObservation]:
         mask = _traffic_color_mask(frame)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -76,7 +77,7 @@ class Phase4LandmarkDetector:
 
             ocr_result = self.ocr.recognize(roi) if class_name == "street_name_sign" else None
             descriptor = self._describe(roi, ocr_result.text if ocr_result else None)
-            p_3d = self._estimate_position(bbox, pose, class_name)
+            p_3d = self._estimate_position(bbox, pose, class_name, depth_metric)
 
             observations.append(
                 LandmarkObservation(
@@ -126,21 +127,46 @@ class Phase4LandmarkDetector:
         bbox: Tuple[int, int, int, int],
         pose: Pose2D,
         class_name: str,
+        depth_metric: Optional[np.ndarray] = None,
     ) -> Point3D:
-        x1, _, x2, _ = bbox
-        cx = (x1 + x2) * 0.5
-        bearing = math.atan2(cx - self.camera_cx, max(self.camera_fx, 1.0))
-        distance = (
-            self.config.assumed_street_name_distance_m
-            if class_name == "street_name_sign"
-            else self.config.assumed_sign_distance_m
-        )
+        x1, y1, x2, y2 = bbox
+        cx_px = (x1 + x2) * 0.5
+        cy_px = (y1 + y2) * 0.5
+
+        distance = None
+        quality = 0.35
+        if depth_metric is not None and depth_metric.ndim >= 2:
+            h, w = depth_metric.shape[:2]
+            if h > 0 and w > 0:
+                margin = 3
+                cy = int(round(cy_px))
+                cx = int(round(cx_px))
+                r0 = max(0, cy - margin)
+                r1 = min(h, cy + margin + 1)
+                c0 = max(0, cx - margin)
+                c1 = min(w, cx + margin + 1)
+                patch = depth_metric[r0:r1, c0:c1]
+                if patch.size > 0:
+                    values = patch[np.isfinite(patch)]
+                    values = values[(values >= 3.0) & (values <= 60.0)]
+                    if values.size > 0:
+                        distance = float(np.median(values))
+                        quality = 0.70
+
+        if distance is None:
+            distance = (
+                self.config.assumed_street_name_distance_m
+                if class_name == "street_name_sign"
+                else self.config.assumed_sign_distance_m
+            )
+
+        bearing = math.atan2(cx_px - self.camera_cx, max(self.camera_fx, 1.0))
         heading = pose.theta + bearing
         return Point3D(
             x=pose.x + distance * math.cos(heading),
             y=pose.y + distance * math.sin(heading),
             z=0.0,
-            quality=0.35,
+            quality=quality,
         )
 
 

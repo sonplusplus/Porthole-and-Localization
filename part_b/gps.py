@@ -1,4 +1,4 @@
-from .phase3_schema import GpsSample, GpsState
+from .schema import GpsSample, GpsState
 
 
 class GpsIntegrityMonitor:

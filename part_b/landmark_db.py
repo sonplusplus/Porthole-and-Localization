@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .phase4_landmark_schema import (
+from .landmark_schema import (
     LandmarkMatch,
     LandmarkObservation,
     LandmarkRecord,
@@ -15,18 +15,30 @@ from .phase4_landmark_schema import (
 )
 
 
+_CLASS_MATCH_DISTANCE: Dict[str, float] = {
+    "pothole": 3.0,
+    "traffic_sign": 8.0,
+    "street_name_sign": 15.0,
+}
+_DEFAULT_MATCH_DISTANCE = 10.0
+
+
 class LandmarkDatabase:
     """Persistent Phase 4 landmark DB keyed by stable task-level landmark IDs."""
 
     def __init__(
         self,
         sequence_id: str,
-        match_distance_m: float = 12.0,
+        match_distance_m: float = _DEFAULT_MATCH_DISTANCE,
         descriptor_threshold: float = 0.82,
+        class_match_distance: Optional[Dict[str, float]] = None,
     ) -> None:
         self.sequence_id = sequence_id
         self.match_distance_m = match_distance_m
         self.descriptor_threshold = descriptor_threshold
+        self.class_match_distance: Dict[str, float] = dict(_CLASS_MATCH_DISTANCE)
+        if class_match_distance:
+            self.class_match_distance.update(class_match_distance)
         self.records: Dict[str, LandmarkRecord] = {}
         self._next_by_class: Dict[str, int] = {}
 
@@ -65,16 +77,17 @@ class LandmarkDatabase:
         return record, match
 
     def find_best_match(self, obs: LandmarkObservation) -> Optional[LandmarkMatch]:
+        max_dist = self.class_match_distance.get(obs.class_name, self.match_distance_m)
         best: Optional[LandmarkMatch] = None
         for record in self.records.values():
             if record.class_name != obs.class_name:
                 continue
 
             distance = euclidean_distance(record.p_3D, obs.p_3D)
-            if distance > self.match_distance_m:
+            if distance > max_dist:
                 continue
 
-            score, reason = self._association_score(record, obs, distance)
+            score, reason = self._association_score(record, obs, distance, max_dist)
             if score <= 0.0:
                 continue
             if best is None or score > best.score:
@@ -123,10 +136,11 @@ class LandmarkDatabase:
         record: LandmarkRecord,
         obs: LandmarkObservation,
         distance: float,
+        max_dist: float,
     ) -> Tuple[float, str]:
         text_score = _text_score(record.d_visual, obs.d_visual)
         descriptor_score = cosine_similarity(record.d_visual.vector, obs.d_visual.vector)
-        distance_score = max(0.0, 1.0 - distance / self.match_distance_m)
+        distance_score = max(0.0, 1.0 - distance / max(max_dist, 1e-6))
 
         if obs.class_name == "street_name_sign" and text_score >= 0.99:
             return 0.70 + 0.30 * distance_score, "same_text_nearby"
@@ -134,7 +148,7 @@ class LandmarkDatabase:
         if descriptor_score >= self.descriptor_threshold:
             return 0.65 * descriptor_score + 0.35 * distance_score, "descriptor_nearby"
 
-        if text_score > 0.0 and distance <= self.match_distance_m * 0.5:
+        if text_score > 0.0 and distance <= max_dist * 0.5:
             return 0.55 * text_score + 0.45 * distance_score, "similar_text_nearby"
 
         return 0.0, "no_match"
@@ -211,4 +225,3 @@ def _weighted_descriptor(
         text_raw=new.text_raw or old.text_raw,
         text_norm=new.text_norm or old.text_norm,
     )
-

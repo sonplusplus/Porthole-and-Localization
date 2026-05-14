@@ -36,6 +36,17 @@ class Pose2D:
 
 @dataclass
 class DeltaPose:
+    """Frame-to-frame vehicle/body-frame motion.
+
+    Contract:
+    - dx: lateral motion in meters, positive to the vehicle/camera right.
+    - dy: forward motion in meters, positive along the vehicle heading.
+    - dtheta: yaw change in radians, positive counter-clockwise in local pose.
+
+    `pose_local` and `fused_pose` are already accumulated in the local/world
+    frame. Consumers must rotate dx/dy by the current heading exactly once.
+    """
+
     dx: float
     dy: float
     dtheta: float
@@ -61,6 +72,20 @@ class EventEstimate:
 
 
 @dataclass
+class HandoverEstimate:
+    mode: str
+    transition: Optional[str]
+    lost_frames: int
+    relock_frames: int
+    gps_correction_noise_m: float
+    latched_gps: Optional[GpsSample]
+    latched_xy: Optional[Tuple[float, float]]
+    latched_theta: Optional[float]
+    loss_error_m: Optional[float]
+    relock_error_m: Optional[float]
+
+
+@dataclass
 class Phase3Frame:
     sequence_id: str
     frame_index: int
@@ -81,6 +106,7 @@ class Phase3Output:
     lane: LaneEstimate
     gps_state: GpsState
     events: EventEstimate
+    handover: Optional[HandoverEstimate] = None
 
     def to_jsonable(self) -> Dict[str, Any]:
         return asdict(self)

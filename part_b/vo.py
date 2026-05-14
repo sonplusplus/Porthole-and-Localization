@@ -5,22 +5,29 @@ import cv2
 import numpy as np
 
 from part_a.calibration import CameraParams
-from .phase3_schema import DeltaPose, Pose2D, empty_delta, empty_pose
+from .schema import DeltaPose, Pose2D, empty_delta, empty_pose
 
 class OrbVisualOdometry:
-    """ORB essential-matrix VO baseline with external scale from KITTI GPS/OXTS."""
+    """ORB essential-matrix VO baseline with external scale from KITTI GPS/OXTS.
+
+    DeltaPose follows the Phase 3 contract: dx/dy are body-frame motion.
+    The accumulated `pose_local` returned by this class is local/world-frame.
+    """
 
     def __init__(
         self,
         cam: CameraParams,
-        max_features: int = 1800,
-        min_matches: int = 40,
-        min_inliers: int = 20,
+        max_features: int = 2000,
+        min_matches: int = 30,
+        min_inliers: int = 15,
+        ratio_test: float = 0.72,
+        fast_threshold: int = 10,
     ) -> None:
         self.cam = cam
         self.min_matches = min_matches
         self.min_inliers = min_inliers
-        self.orb = cv2.ORB_create(nfeatures=max_features, fastThreshold=12)
+        self.ratio_test = ratio_test
+        self.orb = cv2.ORB_create(nfeatures=max_features, fastThreshold=fast_threshold)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self.prev_gray: Optional[np.ndarray] = None
         self.prev_kp = None
@@ -59,22 +66,22 @@ class OrbVisualOdometry:
             return self.pose, DeltaPose(0.0, 0.0, 0.0, scale_hint, len(matches), int(inliers), False)
 
         scale = float(scale_hint if scale_hint > 0.01 else 1.0)
-        tx = float(trans[0, 0]) * scale
-        tz = float(trans[2, 0]) * scale
+        dx_body = float(trans[0, 0]) * scale
+        dy_body = float(trans[2, 0]) * scale
         dtheta = _yaw_from_rotation(rot)
 
         c = math.cos(self.pose.theta)
         s = math.sin(self.pose.theta)
-        dx_world = c * tx + s * tz
-        dy_world = -s * tx + c * tz
+        dx_world = c * dx_body - s * dy_body
+        dy_world = s * dx_body + c * dy_body
         self.pose = Pose2D(
             x=self.pose.x + dx_world,
             y=self.pose.y + dy_world,
             theta=_wrap_angle(self.pose.theta + dtheta),
         )
         delta = DeltaPose(
-            dx=dx_world,
-            dy=dy_world,
+            dx=dx_body,
+            dy=dy_body,
             dtheta=dtheta,
             scale=scale,
             matches=len(matches),
@@ -91,7 +98,7 @@ class OrbVisualOdometry:
             if len(pair) != 2:
                 continue
             m, n = pair
-            if m.distance < 0.75 * n.distance:
+            if m.distance < self.ratio_test * n.distance:
                 good.append(m)
         return good
 

@@ -4,7 +4,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .phase4_landmark_schema import normalize_text
+from .landmark_schema import normalize_text
 
 
 @dataclass

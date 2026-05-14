@@ -1,4 +1,5 @@
 import math
+import warnings
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,10 +10,28 @@ import cv2
 import numpy as np
 
 from part_a.calibration import CameraParams
-from .phase3_schema import GpsSample, ImuSample, Phase3Frame
+from .schema import GpsSample, ImuSample, Phase3Frame
 
 
 KITTI_DATE_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+_KITTI_FALLBACK_PARAMS = {
+    "width": 1242,
+    "height": 375,
+    "fx": 721.5377,
+    "fy": 721.5377,
+    "cx": 609.5593,
+    "cy": 172.854,
+}
+
+
+def _kitti_fallback_with_warning(reason: str) -> CameraParams:
+    warnings.warn(
+        f"Using KITTI default intrinsics ({reason}). Results will be wrong for non-KITTI cameras. "
+        "Provide a calib zip or calib_cam_to_cam.txt.",
+        UserWarning,
+        stacklevel=3,
+    )
+    return CameraParams(**_KITTI_FALLBACK_PARAMS)
 
 
 @dataclass
@@ -191,24 +210,27 @@ class KittiRawSequence:
 
     def _load_camera_params(self) -> CameraParams:
         if self.calib_path is None or not self.calib_path.exists():
-            return CameraParams(width=1242, height=375, fx=721.5377, fy=721.5377, cx=609.5593, cy=172.854)
+            return _kitti_fallback_with_warning("calib path not provided or not found")
 
         if self.calib_path.suffix.lower() == ".zip":
             with zipfile.ZipFile(self.calib_path) as zf:
                 name = next((n for n in zf.namelist() if n.endswith("calib_cam_to_cam.txt")), None)
                 if name is None:
-                    return CameraParams(width=1242, height=375, fx=721.5377, fy=721.5377, cx=609.5593, cy=172.854)
+                    return _kitti_fallback_with_warning("calib_cam_to_cam.txt missing in calib zip")
                 text = zf.read(name).decode("utf-8")
         elif self.calib_path.is_file():
             text = self.calib_path.read_text(encoding="utf-8")
         else:
-            text = (self.calib_path / "calib_cam_to_cam.txt").read_text(encoding="utf-8")
+            calib_file = self.calib_path / "calib_cam_to_cam.txt"
+            if not calib_file.exists():
+                return _kitti_fallback_with_warning("calib_cam_to_cam.txt missing")
+            text = calib_file.read_text(encoding="utf-8")
 
         data = _parse_calib_text(text)
         key = "P_rect_02" if self.camera == "image_02" else "P_rect_03"
         values = data.get(key)
         if values is None or len(values) < 12:
-            return CameraParams(width=1242, height=375, fx=721.5377, fy=721.5377, cx=609.5593, cy=172.854)
+            return _kitti_fallback_with_warning(f"{key} missing or too short")
         p = np.array(values, dtype=np.float64).reshape(3, 4)
         width, height = _parse_size(data.get(f"S_rect_{self.camera[-2:]}", []))
         return CameraParams(
