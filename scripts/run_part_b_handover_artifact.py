@@ -11,9 +11,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence", default="0001")
     parser.add_argument("--max-frames", type=int, default=80)
     parser.add_argument("--lane-backend", default="heuristic", choices=["heuristic", "ufldv2"])
+    parser.add_argument("--lane-side-mode", default="binary_road", choices=["binary_road", "ego_offset"])
     parser.add_argument("--gps-loss-start", type=int, default=20)
     parser.add_argument("--gps-loss-end", type=int, default=55)
     parser.add_argument("--gps-loss-degraded-frames", type=int, default=3)
+    parser.add_argument("--motion-source", default="vo", choices=["vo", "wheel_imu", "vo_wheel_imu"])
     parser.add_argument("--landmark-db", default=None)
     parser.add_argument("--landmark-every-n", type=int, default=5)
     parser.add_argument("--output", default="data/phase3_outputs/phase5_handover_latest.jsonl")
@@ -38,12 +40,16 @@ def main() -> None:
         str(args.max_frames),
         "--lane-backend",
         args.lane_backend,
+        "--lane-side-mode",
+        args.lane_side_mode,
         "--gps-loss-start",
         str(args.gps_loss_start),
         "--gps-loss-end",
         str(args.gps_loss_end),
         "--gps-loss-degraded-frames",
         str(args.gps_loss_degraded_frames),
+        "--motion-source",
+        args.motion_source,
         "--output",
         str(output),
     ]

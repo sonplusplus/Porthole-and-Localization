@@ -22,6 +22,7 @@ class LocalizationEKF:
         q_invalid_xy: float = 0.15,
         q_invalid_theta: float = 0.01,
         r_gps_noise_m: float = 3.0,
+        r_gps_heading_rad: float = math.radians(12.0),
     ) -> None:
         self.x = np.zeros((3, 1), dtype=np.float64)
         self.p = np.array(p0, dtype=np.float64, copy=True) if p0 is not None else np.diag([20.0, 20.0, 0.5]).astype(np.float64)
@@ -30,6 +31,7 @@ class LocalizationEKF:
         self.q_invalid_xy = float(q_invalid_xy)
         self.q_invalid_theta = float(q_invalid_theta)
         self.r_gps_noise_m = float(r_gps_noise_m)
+        self.r_gps_heading_rad = float(r_gps_heading_rad)
         self.initialized = False
 
     def update(
@@ -38,15 +40,21 @@ class LocalizationEKF:
         gps_xy: Optional[Tuple[float, float]],
         gps_state: GpsState,
         gps_noise_m: Optional[float] = None,
+        gps_heading_rad: Optional[float] = None,
+        gps_heading_noise_rad: Optional[float] = None,
     ) -> Pose2D:
         if not self.initialized and gps_xy is not None and gps_state == "good":
             self.x[0, 0] = gps_xy[0]
             self.x[1, 0] = gps_xy[1]
+            if gps_heading_rad is not None:
+                self.x[2, 0] = _wrap_angle(gps_heading_rad)
             self.initialized = True
 
         self._predict(delta)
         if gps_xy is not None and gps_state == "good":
             self._correct_gps(gps_xy, gps_noise_m=gps_noise_m)
+            if gps_heading_rad is not None:
+                self._correct_heading(gps_heading_rad, noise_rad=gps_heading_noise_rad)
 
         return self.pose()
 
@@ -123,6 +131,18 @@ class LocalizationEKF:
         self.x = self.x + k @ y
         self.x[2, 0] = _wrap_angle(self.x[2, 0])
         self.p = (np.eye(3) - k @ h) @ self.p
+
+    def _correct_heading(self, heading_rad: float, noise_rad: Optional[float] = None) -> None:
+        noise = max(float(self.r_gps_heading_rad if noise_rad is None else noise_rad), math.radians(1.0))
+        residual = _wrap_angle(float(heading_rad) - self.x[2, 0])
+        variance = max(float(self.p[2, 2]), 1e-9)
+        gain = variance / (variance + noise * noise)
+        self.x[2, 0] = _wrap_angle(self.x[2, 0] + gain * residual)
+        self.p[2, 2] = max((1.0 - gain) * variance, 1e-9)
+        self.p[0, 2] *= 1.0 - gain
+        self.p[2, 0] = self.p[0, 2]
+        self.p[1, 2] *= 1.0 - gain
+        self.p[2, 1] = self.p[1, 2]
 
 
 def _wrap_angle(value: float) -> float:

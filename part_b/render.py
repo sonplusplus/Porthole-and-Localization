@@ -73,17 +73,20 @@ def _draw_phase3_overlay(
     sample = row.get("sample", {})
     lane = row.get("lane", {})
     delta = row.get("delta_pose", {})
+    vo_delta = row.get("vo_delta_pose") if isinstance(row.get("vo_delta_pose"), dict) else delta
     fused = row.get("fused_pose", {})
     event = row.get("events", {})
 
     frame_index = int(sample.get("frame_index", 0))
     sequence = sample.get("sequence_id", "unknown")
     gps_state = str(row.get("gps_state", "unknown"))
+    motion_delta_source = str(row.get("motion_delta_source") or row.get("motion_source") or "vo")
     lane_side = str(lane.get("lane_side", "unknown"))
     lane_conf = float(lane.get("confidence") or 0.0)
-    vo_valid = bool(delta.get("valid", False))
-    matches = int(delta.get("matches") or 0)
-    inliers = int(delta.get("inliers") or 0)
+    motion_valid = bool(delta.get("valid", False))
+    vo_valid = bool(vo_delta.get("valid", False))
+    matches = int(vo_delta.get("matches") or 0)
+    inliers = int(vo_delta.get("inliers") or 0)
     theta_deg = math.degrees(float(fused.get("theta") or 0.0))
     u_turn = bool(event.get("u_turn", False))
 
@@ -95,7 +98,10 @@ def _draw_phase3_overlay(
     lines = [
         f"Phase 3 KITTI | {sequence} | frame {frame_index}",
         f"GPS: {gps_state} | lane: {lane_side} ({lane_conf:.2f})",
-        f"VO: {'valid' if vo_valid else 'invalid'} | matches {matches} | inliers {inliers}",
+        (
+            f"Motion: {motion_delta_source} ({'valid' if motion_valid else 'invalid'}) | "
+            f"VO {'valid' if vo_valid else 'invalid'} {matches}/{inliers}"
+        ),
         f"Fused pose: x={float(fused.get('x') or 0.0):.1f}m y={float(fused.get('y') or 0.0):.1f}m th={theta_deg:.1f}deg",
         f"U-turn: {'YES' if u_turn else 'no'} | heading delta {float(event.get('heading_delta_deg') or 0.0):.1f}deg",
     ]
@@ -153,11 +159,11 @@ def _draw_minimap(
             upto = idx + 1
 
     _draw_path(frame, trajectory_points["gps"][:upto], bounds, (x0, y0, map_w, map_h), BLUE)
-    _draw_path(frame, trajectory_points["vo"][:upto], bounds, (x0, y0, map_w, map_h), ORANGE)
+    _draw_path(frame, trajectory_points["odom"][:upto], bounds, (x0, y0, map_w, map_h), ORANGE)
     _draw_path(frame, trajectory_points["fused"][:upto], bounds, (x0, y0, map_w, map_h), GREEN)
 
     _legend(frame, x0 + 10, y0 + map_h - 54, "GPS", BLUE)
-    _legend(frame, x0 + 88, y0 + map_h - 54, "VO", ORANGE)
+    _legend(frame, x0 + 88, y0 + map_h - 54, "Odom", ORANGE)
     _legend(frame, x0 + 152, y0 + map_h - 54, "Fused", GREEN)
 
 
@@ -197,7 +203,7 @@ def _map_point(
 
 
 def _trajectory_bounds(points: Dict[str, List[Optional[Point2D]]]) -> Optional[Tuple[float, float, float, float]]:
-    clean = [point for key in ("gps", "vo", "fused") for point in points[key] if point is not None]
+    clean = [point for key in ("gps", "odom", "fused") for point in points[key] if point is not None]
     if not clean:
         return None
     xs = [point[0] for point in clean]
@@ -209,7 +215,7 @@ def _collect_trajectory(rows: Sequence[Dict[str, Any]]) -> Dict[str, List[Option
     return {
         "frame": [int(row.get("sample", {}).get("frame_index", index)) for index, row in enumerate(rows)],
         "gps": [_point(row.get("gps_local_xy")) for row in rows],
-        "vo": [_pose_point(row.get("pose_local")) for row in rows],
+        "odom": [_pose_point(row.get("pose_local")) for row in rows],
         "fused": [_pose_point(row.get("fused_pose")) for row in rows],
     }
 

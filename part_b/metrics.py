@@ -40,10 +40,16 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     lane_counts = Counter(_get(row, ("lane", "lane_side"), "unknown") for row in rows)
     gps_state_counts = Counter(_get(row, ("gps_state",), "unknown") for row in rows)
-    vo_valid = [bool(_get(row, ("delta_pose", "valid"), False)) for row in rows]
-    vo_matches = [_get_float(row, ("delta_pose", "matches")) for row in rows]
-    vo_inliers = [_get_float(row, ("delta_pose", "inliers")) for row in rows]
+    motion_valid = [bool(_get(row, ("delta_pose", "valid"), False)) for row in rows]
+    vo_deltas = [_delta_for(row, "vo_delta_pose") for row in rows]
+    vo_valid = [bool(delta.get("valid", False)) for delta in vo_deltas]
+    vo_matches = [_dict_float(delta, "matches") for delta in vo_deltas]
+    vo_inliers = [_dict_float(delta, "inliers") for delta in vo_deltas]
     vo_scale_sources = Counter(_get(row, ("vo_scale_source",), "unknown") for row in rows)
+    motion_delta_sources = Counter(
+        _get(row, ("motion_delta_source",), _get(row, ("motion_source",), "vo"))
+        for row in rows
+    )
     lane_conf = [_get_float(row, ("lane", "confidence")) for row in rows]
     heading_delta = [_get_float(row, ("events", "heading_delta_deg")) for row in rows]
     handover_modes = Counter(_get(row, ("handover", "mode"), "unknown") for row in rows)
@@ -54,7 +60,11 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     gps_points = [_point(row.get("gps_local_xy")) for row in rows]
-    vo_points = [_pose_point(row.get("pose_local")) for row in rows]
+    odom_points = [_pose_point(row.get("pose_local")) for row in rows]
+    vo_points = [
+        _pose_point(row.get("vo_pose_local")) or _pose_point(row.get("pose_local"))
+        for row in rows
+    ]
     fused_points = [_pose_point(row.get("fused_pose")) for row in rows]
 
     good_gps_indexes = [
@@ -63,8 +73,10 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if row.get("gps_state") == "good" and gps_points[i] is not None
     ]
     fused_errors = [_distance(fused_points[i], gps_points[i]) for i in good_gps_indexes]
+    odom_errors = [_distance(odom_points[i], gps_points[i]) for i in good_gps_indexes]
     vo_errors = [_distance(vo_points[i], gps_points[i]) for i in good_gps_indexes]
     fused_errors = [value for value in fused_errors if value is not None]
+    odom_errors = [value for value in odom_errors if value is not None]
     vo_errors = [value for value in vo_errors if value is not None]
 
     u_turn_frames = [
@@ -99,6 +111,9 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "lane_counts": dict(lane_counts),
         "lane_unknown_rate": lane_counts.get("unknown", 0) / len(rows),
         "avg_lane_confidence": _safe_mean(lane_conf),
+        "motion_valid_frames": sum(motion_valid),
+        "motion_valid_ratio": sum(motion_valid) / len(rows),
+        "motion_delta_source_counts": dict(motion_delta_sources),
         "vo_valid_frames": sum(vo_valid),
         "vo_valid_ratio": sum(vo_valid) / len(rows),
         "avg_vo_matches": _safe_mean(vo_matches),
@@ -107,10 +122,13 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "p95_vo_inliers": _percentile(vo_inliers, 0.95),
         "vo_scale_source_counts": dict(vo_scale_sources),
         "gps_path_length_m": _path_length(gps_points),
+        "odometry_path_length_m": _path_length(odom_points),
         "vo_path_length_m": _path_length(vo_points),
         "fused_path_length_m": _path_length(fused_points),
+        "odometry_error_vs_gps_m": _error_summary(odom_errors),
         "vo_error_vs_gps_m": _error_summary(vo_errors),
         "fused_error_vs_gps_m": _error_summary(fused_errors),
+        "final_odometry_error_m": _last_error(odom_points, gps_points),
         "final_vo_error_m": _last_error(vo_points, gps_points),
         "final_fused_error_m": _last_error(fused_points, gps_points),
         "u_turn_frames": u_turn_frames,
@@ -139,12 +157,12 @@ def write_plots(rows: Sequence[Dict[str, Any]], metrics: Dict[str, Any], output_
 
 def _plot_trajectory(rows: Sequence[Dict[str, Any]], output: str) -> None:
     gps = [_point(row.get("gps_local_xy")) for row in rows]
-    vo = [_pose_point(row.get("pose_local")) for row in rows]
+    odom = [_pose_point(row.get("pose_local")) for row in rows]
     fused = [_pose_point(row.get("fused_pose")) for row in rows]
 
     plt.figure(figsize=(8, 6))
     _plot_xy(gps, "GPS local", "#2f6fdd", linewidth=2.0)
-    _plot_xy(vo, "VO", "#d66a2f", linewidth=1.5)
+    _plot_xy(odom, "Odometry", "#d66a2f", linewidth=1.5)
     _plot_xy(fused, "EKF fused", "#2f9e44", linewidth=1.8)
     plt.title("Phase 3 trajectory")
     plt.xlabel("x (m)")
@@ -159,23 +177,23 @@ def _plot_trajectory(rows: Sequence[Dict[str, Any]], output: str) -> None:
 
 def _plot_error(rows: Sequence[Dict[str, Any]], output: str) -> None:
     frames: List[int] = []
-    vo_errors: List[float] = []
+    odom_errors: List[float] = []
     fused_errors: List[float] = []
     for row in rows:
         gps = _point(row.get("gps_local_xy"))
         if gps is None:
             continue
         frame = int(_get(row, ("sample", "frame_index"), len(frames)))
-        vo_error = _distance(_pose_point(row.get("pose_local")), gps)
+        odom_error = _distance(_pose_point(row.get("pose_local")), gps)
         fused_error = _distance(_pose_point(row.get("fused_pose")), gps)
-        if vo_error is None or fused_error is None:
+        if odom_error is None or fused_error is None:
             continue
         frames.append(frame)
-        vo_errors.append(vo_error)
+        odom_errors.append(odom_error)
         fused_errors.append(fused_error)
 
     plt.figure(figsize=(9, 4.8))
-    plt.plot(frames, vo_errors, label="VO vs GPS", color="#d66a2f", linewidth=1.5)
+    plt.plot(frames, odom_errors, label="Odometry vs GPS", color="#d66a2f", linewidth=1.5)
     plt.plot(frames, fused_errors, label="EKF fused vs GPS", color="#2f9e44", linewidth=1.8)
     plt.title("Phase 3 localization error")
     plt.xlabel("frame")
@@ -306,6 +324,21 @@ def _pose_point(value: Any) -> Optional[Point2D]:
     if not isinstance(value, dict):
         return None
     return float(value.get("x", 0.0)), float(value.get("y", 0.0))
+
+
+def _delta_for(row: Dict[str, Any], key: str) -> Dict[str, Any]:
+    value = row.get(key)
+    if isinstance(value, dict):
+        return value
+    fallback = row.get("delta_pose")
+    return fallback if isinstance(fallback, dict) else {}
+
+
+def _dict_float(value: Dict[str, Any], key: str) -> Optional[float]:
+    raw = value.get(key)
+    if raw is None:
+        return None
+    return float(raw)
 
 
 def _safe_mean(values: Iterable[Optional[float]]) -> float:

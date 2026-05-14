@@ -1,11 +1,13 @@
 import argparse
 import json
+import math
 import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Tuple
 
 from .detector import Phase4LandmarkDetector
+from .dead_reckoning import WheelImuDeadReckoner, choose_motion_delta, integrate_body_delta
 from .events import UTurnDetector
 from .fusion import LocalizationEKF
 from .ghost_projection import project_landmark, reprojection_error_px
@@ -14,7 +16,7 @@ from .kitti import KittiRawSequence, discover_kitti_sequences
 from .lane import create_lane_detector
 from .landmark_db import LandmarkDatabase
 from .ocr import create_ocr_backend
-from .schema import LaneEstimate, Phase3Output, Pose2D, ground_delta_from_points
+from .schema import DeltaPose, LaneEstimate, MotionSource, Phase3Output, Pose2D, ground_delta_from_points
 from .vo import OrbVisualOdometry
 from .handover import GpsHandoverManager, GpsLossSimulator
 
@@ -28,6 +30,7 @@ def run_sequence(
     lane_backend: str = "heuristic",
     lane_model: str = "models/ufldv2_culane_res34.onnx",
     lane_dataset: str = "culane",
+    lane_side_mode: str = "binary_road",
     lane_every_n: int = 3,
     landmark_db_path: Optional[str] = None,
     landmark_every_n: int = 5,
@@ -36,11 +39,18 @@ def run_sequence(
     gps_loss_start: Optional[int] = None,
     gps_loss_end: Optional[int] = None,
     gps_loss_degraded_frames: int = 5,
+    motion_source: MotionSource = "vo",
 ) -> None:
     seq = KittiRawSequence(sync_path=sync_path, calib_path=calib_path, camera=camera)
     gps_monitor = GpsIntegrityMonitor()
-    lane_detector = create_lane_detector(backend=lane_backend, model_path=lane_model, dataset=lane_dataset)
+    lane_detector = create_lane_detector(
+        backend=lane_backend,
+        model_path=lane_model,
+        dataset=lane_dataset,
+        lane_side_mode=lane_side_mode,
+    )
     vo = OrbVisualOdometry(seq.camera_params)
+    dead_reckoner = WheelImuDeadReckoner()
     ekf = LocalizationEKF()
     events = UTurnDetector()
     gps_loss = GpsLossSimulator(
@@ -63,16 +73,20 @@ def run_sequence(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     prev_scale_xy: Optional[Tuple[float, float]] = None
+    prev_scale_frame: Optional[int] = None
+    prev_heading_xy: Optional[Tuple[float, float]] = None
     last_good_scale_hint = 0.0
     vo_scale_source_counts = {
         "gps_good": 0,
         "last_good_gps_scale": 0,
         "unit_fallback": 0,
     }
+    motion_delta_source_counts = {}
     count = 0
     gps_state_counts = {"good": 0, "degraded": 0, "lost": 0}
-    lane_counts = {"left": 0, "right": 0, "center": 0, "unknown": 0}
+    lane_counts = {"left": 0, "right": 0}
     valid_vo = 0
+    valid_motion = 0
     total_inliers = 0
     u_turn_count = 0
     total_ms = []
@@ -83,6 +97,7 @@ def run_sequence(
     relock_errors = []
     max_loss_error = 0.0
     prev_fused_pose = Pose2D(x=0.0, y=0.0, theta=0.0)
+    motion_pose = Pose2D(x=0.0, y=0.0, theta=0.0)
     lane_every_n = max(1, int(lane_every_n))
     landmark_every_n = max(1, int(landmark_every_n))
     last_lane: Optional[LaneEstimate] = None
@@ -99,21 +114,55 @@ def run_sequence(
                 gps_sample = gps_loss.apply(sample.meta.gps, sample.meta.frame_index)
                 sample_meta = replace(sample.meta, gps=gps_sample)
                 gps_state = gps_monitor.update(gps_sample)
-                (
-                    scale_hint,
-                    scale_source,
-                    prev_scale_xy,
-                    last_good_scale_hint,
-                ) = _vo_scale_hint(
+                gps_heading_rad, prev_heading_xy = _gps_course_heading(
                     gps_state=gps_state,
                     curr_xy=sample.local_xy,
-                    prev_good_xy=prev_scale_xy,
-                    last_good_scale_hint=last_good_scale_hint,
+                    prev_good_xy=prev_heading_xy,
                 )
+                wheel_imu_delta = dead_reckoner.update(
+                    timestamp=sample_meta.timestamp,
+                    speed_mps=sample_meta.gps.speed_mps,
+                    gyro_z_rad_s=sample_meta.imu.gz,
+                )
+                if motion_source == "vo":
+                    (
+                        scale_hint,
+                        scale_source,
+                        prev_scale_xy,
+                        prev_scale_frame,
+                        last_good_scale_hint,
+                    ) = _vo_scale_hint(
+                        gps_state=gps_state,
+                        curr_xy=sample.local_xy,
+                        curr_frame=sample.meta.frame_index,
+                        prev_good_xy=prev_scale_xy,
+                        prev_good_frame=prev_scale_frame,
+                        last_good_scale_hint=last_good_scale_hint,
+                    )
+                else:
+                    scale_hint, scale_source = _wheel_imu_scale_hint(wheel_imu_delta)
 
                 t0 = time.perf_counter()
-                pose, delta = vo.update(sample.frame, scale_hint=scale_hint)
+                vo_pose, vo_delta = vo.update(sample.frame, scale_hint=scale_hint)
                 vo_ms.append((time.perf_counter() - t0) * 1000.0)
+                raw_vo_pose = vo_pose
+                if gps_state == "good" and sample.local_xy is not None:
+                    vo_pose = Pose2D(
+                        x=float(sample.local_xy[0]),
+                        y=float(sample.local_xy[1]),
+                        theta=float(gps_heading_rad if gps_heading_rad is not None else vo_pose.theta),
+                    )
+                    vo.pose = vo_pose
+                motion_delta, motion_delta_source = choose_motion_delta(
+                    motion_source=motion_source,
+                    vo_delta=vo_delta,
+                    wheel_imu_delta=wheel_imu_delta,
+                )
+                if motion_source == "vo":
+                    pose = vo_pose
+                else:
+                    motion_pose = integrate_body_delta(motion_pose, motion_delta)
+                    pose = motion_pose
 
                 t0 = time.perf_counter()
                 if last_lane is None or count % lane_every_n == 0:
@@ -133,10 +182,11 @@ def run_sequence(
                 )
                 gps_xy_for_correction = sample.local_xy if gps_sample.valid else None
                 fused_pose = ekf.update(
-                    delta,
+                    motion_delta,
                     gps_xy_for_correction,
                     gps_state,
                     gps_noise_m=handover.gps_correction_noise_m,
+                    gps_heading_rad=gps_heading_rad,
                 )
                 if landmark_db is not None and landmark_detector is not None and count % landmark_every_n == 0:
                     detected_landmarks = landmark_detector.detect(
@@ -180,18 +230,26 @@ def run_sequence(
                     gps_local_xy=sample.local_xy,
                     pose_local=pose,
                     fused_pose=fused_pose,
-                    delta_pose=delta,
+                    delta_pose=motion_delta,
                     lane=lane,
                     gps_state=gps_state,
                     events=event_estimate,
                     handover=handover,
                     vo_scale_source=scale_source,
                     vo_scale_hint_m=scale_hint,
+                    motion_source=motion_source,
+                    motion_delta_source=motion_delta_source,
+                    vo_pose_local=raw_vo_pose,
+                    vo_delta_pose=vo_delta,
+                    wheel_imu_delta_pose=wheel_imu_delta,
                 )
                 f.write(json.dumps(row.to_jsonable(), ensure_ascii=False) + "\n")
                 prev_fused_pose = fused_pose
                 count += 1
                 vo_scale_source_counts[scale_source] = vo_scale_source_counts.get(scale_source, 0) + 1
+                motion_delta_source_counts[motion_delta_source] = (
+                    motion_delta_source_counts.get(motion_delta_source, 0) + 1
+                )
                 gps_state_counts[gps_state] += 1
                 if handover.transition:
                     handover_transitions[handover.transition] = handover_transitions.get(handover.transition, 0) + 1
@@ -200,9 +258,11 @@ def run_sequence(
                 if handover.relock_error_m is not None:
                     relock_errors.append(handover.relock_error_m)
                 lane_counts[lane.lane_side] = lane_counts.get(lane.lane_side, 0) + 1
-                if delta.valid:
+                if motion_delta.valid:
+                    valid_motion += 1
+                if vo_delta.valid:
                     valid_vo += 1
-                    total_inliers += delta.inliers
+                    total_inliers += vo_delta.inliers
                 if event_estimate.u_turn:
                     u_turn_count += 1
                 total_ms.append((time.perf_counter() - frame_t0) * 1000.0)
@@ -217,6 +277,7 @@ def run_sequence(
         "lane_backend": lane_backend,
         "lane_model": lane_model,
         "lane_dataset": lane_dataset,
+        "lane_side_mode": lane_side_mode,
         "lane_every_n": lane_every_n,
         "landmarks": {
             "enabled": landmark_db_path is not None,
@@ -240,8 +301,17 @@ def run_sequence(
             "end_frame": gps_loss_end,
             "degraded_frames": gps_loss_degraded_frames,
         },
+        "motion": {
+            "source": motion_source,
+            "delta_source_counts": motion_delta_source_counts,
+            "valid_motion_frames": valid_motion,
+            "wheel_imu_note": (
+                "KITTI/demo speed_mps is the OXTS velocity proxy for wheel CAN speed; "
+                "imu.gz is used as yaw-rate. GPS XY is not used for wheel/IMU scale."
+            ),
+        },
         "vo_scale": {
-            "policy": "Use GPS local delta only while GPS state is good; degraded/lost frames use the last good scale hint, then unit fallback.",
+            "policy": _scale_policy(motion_source),
             "source_counts": vo_scale_source_counts,
             "last_good_scale_hint_m": last_good_scale_hint,
         },
@@ -316,9 +386,11 @@ def _percentile(values, q: float):
 def _vo_scale_hint(
     gps_state: str,
     curr_xy: Optional[Tuple[float, float]],
+    curr_frame: int,
     prev_good_xy: Optional[Tuple[float, float]],
+    prev_good_frame: Optional[int],
     last_good_scale_hint: float,
-) -> Tuple[float, str, Optional[Tuple[float, float]], float]:
+) -> Tuple[float, str, Optional[Tuple[float, float]], Optional[int], float]:
     """Return an honest monocular VO scale hint for GPS-loss experiments.
 
     KITTI still has hidden ground-truth GPS local XY even when we simulate GPS
@@ -327,15 +399,76 @@ def _vo_scale_hint(
     """
 
     if gps_state == "good" and curr_xy is not None:
-        scale_hint = ground_delta_from_points(prev_good_xy, curr_xy)
+        frame_gap = None if prev_good_frame is None else int(curr_frame) - int(prev_good_frame)
+        if prev_good_xy is not None and frame_gap is not None and frame_gap <= 1:
+            scale_hint = ground_delta_from_points(prev_good_xy, curr_xy)
+            if scale_hint > 0.01:
+                last_good_scale_hint = scale_hint
+            return scale_hint, "gps_good", curr_xy, int(curr_frame), last_good_scale_hint
+
+        if last_good_scale_hint > 0.01:
+            return (
+                last_good_scale_hint,
+                "last_good_gps_scale",
+                curr_xy,
+                int(curr_frame),
+                last_good_scale_hint,
+            )
+
+        scale_hint = 0.0
         if scale_hint > 0.01:
             last_good_scale_hint = scale_hint
-        return scale_hint, "gps_good", curr_xy, last_good_scale_hint
+        return scale_hint, "gps_good", curr_xy, int(curr_frame), last_good_scale_hint
 
     if last_good_scale_hint > 0.01:
-        return last_good_scale_hint, "last_good_gps_scale", prev_good_xy, last_good_scale_hint
+        return (
+            last_good_scale_hint,
+            "last_good_gps_scale",
+            prev_good_xy,
+            prev_good_frame,
+            last_good_scale_hint,
+        )
 
-    return 0.0, "unit_fallback", prev_good_xy, last_good_scale_hint
+    return 0.0, "unit_fallback", prev_good_xy, prev_good_frame, last_good_scale_hint
+
+
+def _gps_course_heading(
+    gps_state: str,
+    curr_xy: Optional[Tuple[float, float]],
+    prev_good_xy: Optional[Tuple[float, float]],
+    min_distance_m: float = 0.5,
+) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+    if gps_state != "good" or curr_xy is None:
+        return None, prev_good_xy
+
+    if prev_good_xy is None:
+        return None, curr_xy
+
+    dx = float(curr_xy[0] - prev_good_xy[0])
+    dy = float(curr_xy[1] - prev_good_xy[1])
+    if math.hypot(dx, dy) < min_distance_m:
+        return None, prev_good_xy
+
+    # Pose theta uses +Y as vehicle-forward when theta=0.
+    return float(math.atan2(-dx, dy)), curr_xy
+
+
+def _wheel_imu_scale_hint(delta: DeltaPose) -> Tuple[float, str]:
+    if delta.valid:
+        return delta.scale, "wheel_imu_oxts_proxy"
+    return 0.0, "wheel_imu_unavailable"
+
+
+def _scale_policy(motion_source: MotionSource) -> str:
+    if motion_source == "vo":
+        return (
+            "Use GPS local delta only while GPS state is good; degraded/lost frames use "
+            "the last good scale hint, then unit fallback."
+        )
+    return (
+        "Use gps.speed_mps as a KITTI/OXTS proxy for wheel speed and imu.gz for yaw-rate; "
+        "no hidden GPS XY scale is used by wheel/IMU modes."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,6 +483,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lane-backend", default="heuristic", choices=["ufldv2", "heuristic"])
     parser.add_argument("--lane-model", default="models/ufldv2_culane_res34.onnx", help="UFLDv2 ONNX lane model")
     parser.add_argument("--lane-dataset", default="culane", choices=["culane", "tusimple", "curvelanes"])
+    parser.add_argument(
+        "--lane-side-mode",
+        default="binary_road",
+        choices=["binary_road", "ego_offset"],
+        help=(
+            "binary_road returns only left/right for the current road lane; "
+            "ego_offset keeps the old left/center/right/unknown camera-offset semantics."
+        ),
+    )
     parser.add_argument("--lane-every-n", type=int, default=3, help="Run lane inference once every N processed frames")
     parser.add_argument("--landmark-db", default=None, help="Optional Phase 4 landmark JSONL for EKF landmark correction")
     parser.add_argument("--landmark-every-n", type=int, default=5, help="Run landmark detection/correction once every N frames")
@@ -363,6 +505,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-loss-start", type=int, default=None, help="First frame to simulate degraded/lost GPS")
     parser.add_argument("--gps-loss-end", type=int, default=None, help="Last frame to simulate degraded/lost GPS")
     parser.add_argument("--gps-loss-degraded-frames", type=int, default=5, help="Frames kept degraded before GPS is lost")
+    parser.add_argument(
+        "--motion-source",
+        default="vo",
+        choices=["vo", "wheel_imu", "vo_wheel_imu"],
+        help="Odometry source for EKF predict: VO baseline, wheel/IMU dead reckoning, or VO with wheel/IMU scale/yaw",
+    )
     return parser.parse_args()
 
 
@@ -380,6 +528,7 @@ def main() -> None:
         lane_backend=args.lane_backend,
         lane_model=args.lane_model,
         lane_dataset=args.lane_dataset,
+        lane_side_mode=args.lane_side_mode,
         lane_every_n=args.lane_every_n,
         landmark_db_path=args.landmark_db,
         landmark_every_n=args.landmark_every_n,
@@ -388,6 +537,7 @@ def main() -> None:
         gps_loss_start=args.gps_loss_start,
         gps_loss_end=args.gps_loss_end,
         gps_loss_degraded_frames=args.gps_loss_degraded_frames,
+        motion_source=args.motion_source,
     )
 
 

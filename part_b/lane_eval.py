@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 
-VALID_LABELS = {"left", "right", "center", "unknown"}
+VALID_LABELS = {"left", "right"}
 
 
 def load_predictions(path: str) -> Dict[int, str]:

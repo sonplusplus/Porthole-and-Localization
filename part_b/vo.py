@@ -67,7 +67,7 @@ class OrbVisualOdometry:
 
         scale = float(scale_hint if scale_hint > 0.01 else 1.0)
         dx_body = float(trans[0, 0]) * scale
-        dy_body = float(trans[2, 0]) * scale
+        dy_body = -float(trans[2, 0]) * scale
         dtheta = _yaw_from_rotation(rot)
 
         c = math.cos(self.pose.theta)

@@ -3,6 +3,7 @@ from typing import Any, Dict, Literal, Optional, Tuple
 
 
 GpsState = Literal["good", "degraded", "lost"]
+MotionSource = Literal["vo", "wheel_imu", "vo_wheel_imu"]
 LaneSide = Literal["left", "right", "center", "unknown"]
 
 
@@ -109,6 +110,11 @@ class Phase3Output:
     handover: Optional[HandoverEstimate] = None
     vo_scale_source: Optional[str] = None
     vo_scale_hint_m: Optional[float] = None
+    motion_source: MotionSource = "vo"
+    motion_delta_source: Optional[str] = None
+    vo_pose_local: Optional[Pose2D] = None
+    vo_delta_pose: Optional[DeltaPose] = None
+    wheel_imu_delta_pose: Optional[DeltaPose] = None
 
     def to_jsonable(self) -> Dict[str, Any]:
         return asdict(self)

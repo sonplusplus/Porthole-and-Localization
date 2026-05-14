@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -9,6 +9,7 @@ from .schema import LaneEstimate
 
 
 Point = Tuple[float, float]
+LaneSideMode = Literal["binary_road", "ego_offset"]
 
 
 class FastHeuristicLaneDetector:
@@ -28,6 +29,8 @@ class FastHeuristicLaneDetector:
         process_width: int = 640,
         min_confidence: float = 0.25,
         smoothing: float = 0.65,
+        lane_side_mode: LaneSideMode = "binary_road",
+        default_side: str = "right",
     ) -> None:
         self.center_deadband_px = center_deadband_px
         self.center_deadband_ratio = center_deadband_ratio
@@ -35,7 +38,10 @@ class FastHeuristicLaneDetector:
         self.process_width = process_width
         self.min_confidence = min_confidence
         self.smoothing = smoothing
+        self.lane_side_mode = lane_side_mode
+        self.default_side = _normalize_binary_side(default_side)
         self.prev_lane_center: Optional[float] = None
+        self.prev_lane_side: Optional[str] = None
 
     def estimate(self, frame: np.ndarray) -> LaneEstimate:
         h, w = frame.shape[:2]
@@ -121,16 +127,18 @@ class FastHeuristicLaneDetector:
         if confidence < self.min_confidence:
             return self._estimate_legacy(frame)
 
-        offset = (w * 0.5) - lane_center
-        if abs(offset) <= self._center_deadband(w):
-            side = "center"
-        elif offset < 0:
-            side = "left"
-        else:
-            side = "right"
+        side = self._side_from_lane_center(lane_center, w)
         return LaneEstimate(side, float(lane_center), float(confidence), len(left_x), len(right_x))
 
     def _unknown(self, left_count: int = 0, right_count: int = 0) -> LaneEstimate:
+        if self.lane_side_mode == "binary_road":
+            return LaneEstimate(
+                self.prev_lane_side or self.default_side,
+                self.prev_lane_center,
+                0.0,
+                left_count,
+                right_count,
+            )
         return LaneEstimate("unknown", None, 0.0, left_count, right_count)
 
     def _estimate_legacy(self, frame: np.ndarray) -> LaneEstimate:
@@ -197,19 +205,25 @@ class FastHeuristicLaneDetector:
         self.prev_lane_center = lane_center
 
         confidence = min(1.0, (len(left_x) + len(right_x)) / 12.0)
-        offset = (w * 0.5) - lane_center
-        if abs(offset) <= self._center_deadband(w):
-            side = "center"
-        elif offset < 0:
-            side = "left"
-        else:
-            side = "right"
+        side = self._side_from_lane_center(lane_center, w)
         return LaneEstimate(side, float(lane_center), float(confidence), len(left_x), len(right_x))
 
     def _center_deadband(self, width: int) -> float:
         if self.center_deadband_px is not None:
             return float(self.center_deadband_px)
         return float(self.center_deadband_ratio * width)
+
+    def _side_from_lane_center(self, lane_center: float, image_width: int) -> str:
+        image_center = image_width * 0.5
+        if self.lane_side_mode == "ego_offset":
+            offset = image_center - lane_center
+            if abs(offset) <= self._center_deadband(image_width):
+                return "center"
+            return "left" if offset < 0 else "right"
+
+        side = "right" if lane_center >= image_center else "left"
+        self.prev_lane_side = side
+        return side
 
 
 class Ufldv2OnnxLaneDetector:
@@ -220,8 +234,9 @@ class Ufldv2OnnxLaneDetector:
     - BGR float32 image is scaled to [0, 1] and fed as NCHW
     - outputs are expected to include loc_row, loc_col, exist_row, exist_col
 
-    The returned `LaneEstimate` keeps the Phase 3 contract: it reports whether
-    the camera/vehicle center is left, right, or centered relative to the lane.
+    By default the returned `LaneEstimate` is the binary road lane side:
+    "left" or "right". The old ego-offset semantics can still be selected with
+    lane_side_mode="ego_offset" for debugging.
     """
 
     def __init__(
@@ -236,6 +251,8 @@ class Ufldv2OnnxLaneDetector:
         center_deadband_px: float = 45.0,
         smoothing: float = 0.75,
         max_missing_frames: int = 2,
+        lane_side_mode: LaneSideMode = "binary_road",
+        default_side: str = "right",
         providers: Optional[List[str]] = None,
     ) -> None:
         path = Path(model_path)
@@ -254,8 +271,11 @@ class Ufldv2OnnxLaneDetector:
         self.center_deadband_px = center_deadband_px
         self.smoothing = smoothing
         self.max_missing_frames = max_missing_frames
+        self.lane_side_mode = lane_side_mode
+        self.default_side = _normalize_binary_side(default_side)
         self.prev_lane_center: Optional[float] = None
         self.prev_lane_width: Optional[float] = None
+        self.prev_lane_side: Optional[str] = None
         self.missing_frames = 0
         self.row_anchor, self.col_anchor = _anchors(self.dataset, num_row, num_col)
 
@@ -272,7 +292,12 @@ class Ufldv2OnnxLaneDetector:
     def estimate(self, frame: np.ndarray) -> LaneEstimate:
         h, w = frame.shape[:2]
         lanes = self.lane_points(frame)
-        left_lane, right_lane = self._ego_lane_pair(lanes, image_center=w * 0.5, image_width=w, image_height=h)
+        left_idx, left_lane, right_idx, right_lane = self._ego_lane_pair(
+            lanes,
+            image_center=w * 0.5,
+            image_width=w,
+            image_height=h,
+        )
 
         if not left_lane or not right_lane:
             return self._missing_estimate(len(left_lane), len(right_lane))
@@ -298,15 +323,17 @@ class Ufldv2OnnxLaneDetector:
         self.prev_lane_width = lane_width
         self.missing_frames = 0
 
-        offset = (w * 0.5) - lane_center
         confidence = min(1.0, (len(left_lane) + len(right_lane)) / max(self.num_row, 1))
-
-        if abs(offset) <= self.center_deadband_px:
-            side = "center"
-        elif offset < 0:
-            side = "left"
-        else:
-            side = "right"
+        side = self._side_from_lane_geometry(
+            lanes=lanes,
+            left_idx=left_idx,
+            right_idx=right_idx,
+            left_x=left_x,
+            right_x=right_x,
+            lane_center=lane_center,
+            image_width=w,
+            image_height=h,
+        )
         return LaneEstimate(side, float(lane_center), float(confidence), len(left_lane), len(right_lane))
 
     def lane_points(self, frame: np.ndarray) -> List[List[Point]]:
@@ -394,7 +421,7 @@ class Ufldv2OnnxLaneDetector:
         image_center: float,
         image_width: int,
         image_height: int,
-    ) -> Tuple[List[Point], List[Point]]:
+    ) -> Tuple[int, List[Point], int, List[Point]]:
         if len(lanes) >= 3 and lanes[1] and lanes[2]:
             left_x = _lane_x_at_y(lanes[1], image_height * 0.78)
             right_x = _lane_x_at_y(lanes[2], image_height * 0.78)
@@ -404,7 +431,7 @@ class Ufldv2OnnxLaneDetector:
                 and left_x < image_center < right_x
                 and self._lane_width_is_plausible(right_x - left_x, image_width)
             ):
-                return lanes[1], lanes[2]
+                return 1, lanes[1], 2, lanes[2]
 
         candidates = []
         y_eval = None
@@ -413,22 +440,24 @@ class Ufldv2OnnxLaneDetector:
                 max_y = max(point[1] for point in lane)
                 y_eval = max(max_y if y_eval is None else y_eval, max_y)
         if y_eval is None:
-            return [], []
+            return -1, [], -1, []
 
-        for lane in lanes:
+        for lane_idx, lane in enumerate(lanes):
             x = _lane_x_at_y(lane, y_eval)
             if x is None:
                 continue
-            candidates.append((x, lane))
+            candidates.append((x, lane_idx, lane))
 
-        left = [lane for x, lane in candidates if x < image_center]
-        right = [lane for x, lane in candidates if x >= image_center]
+        left = [(x, lane_idx, lane) for x, lane_idx, lane in candidates if x < image_center]
+        right = [(x, lane_idx, lane) for x, lane_idx, lane in candidates if x >= image_center]
         if not left or not right:
-            return [], []
-        return max(left, key=lambda lane: _lane_x_at_y(lane, y_eval) or -1.0), min(
+            return -1, [], -1, []
+        left_choice = max(left, key=lambda item: item[0])
+        right_choice = min(
             right,
-            key=lambda lane: _lane_x_at_y(lane, y_eval) or float("inf"),
+            key=lambda item: item[0],
         )
+        return left_choice[1], left_choice[2], right_choice[1], right_choice[2]
 
     def _lane_width_is_plausible(self, width: float, image_width: int) -> bool:
         min_width = max(80.0, 0.08 * image_width)
@@ -441,22 +470,81 @@ class Ufldv2OnnxLaneDetector:
 
     def _missing_estimate(self, left_count: int, right_count: int) -> LaneEstimate:
         self.missing_frames += 1
+        if self.lane_side_mode == "binary_road":
+            side = self.prev_lane_side or self.default_side
+            confidence = 0.20 if self.prev_lane_center is not None else 0.0
+            return LaneEstimate(side, self.prev_lane_center, confidence, left_count, right_count)
         if self.prev_lane_center is not None and self.missing_frames <= self.max_missing_frames:
             return LaneEstimate("unknown", float(self.prev_lane_center), 0.20, left_count, right_count)
         return LaneEstimate("unknown", None, 0.0, left_count, right_count)
+
+    def _side_from_lane_geometry(
+        self,
+        lanes: List[List[Point]],
+        left_idx: int,
+        right_idx: int,
+        left_x: float,
+        right_x: float,
+        lane_center: float,
+        image_width: int,
+        image_height: int,
+    ) -> str:
+        image_center = image_width * 0.5
+        if self.lane_side_mode == "ego_offset":
+            offset = image_center - lane_center
+            if abs(offset) <= self.center_deadband_px:
+                return "center"
+            return "left" if offset < 0 else "right"
+
+        y_eval = image_height * 0.78
+        min_gap = max(20.0, 0.03 * image_width)
+        detected_x: List[float] = []
+        has_left_neighbor = False
+        has_right_neighbor = False
+        for lane_idx, lane in enumerate(lanes):
+            x = _lane_x_at_y(lane, y_eval)
+            if x is None:
+                continue
+            detected_x.append(x)
+            if lane_idx in {left_idx, right_idx}:
+                continue
+            if x < left_x - min_gap:
+                has_left_neighbor = True
+            elif x > right_x + min_gap:
+                has_right_neighbor = True
+
+        if has_left_neighbor != has_right_neighbor:
+            side = "right" if has_left_neighbor else "left"
+        else:
+            road_center = 0.5 * (min(detected_x) + max(detected_x)) if len(detected_x) >= 3 else image_center
+            if abs(lane_center - road_center) <= self.center_deadband_px:
+                side = self.prev_lane_side or ("right" if lane_center >= image_center else "left")
+            else:
+                side = "right" if lane_center >= road_center else "left"
+
+        self.prev_lane_side = side
+        return side
 
 
 def create_lane_detector(
     backend: str,
     model_path: str = "models/ufldv2_culane_res34.onnx",
     dataset: str = "culane",
+    lane_side_mode: LaneSideMode = "binary_road",
 ):
     backend = backend.lower()
     if backend == "ufldv2":
-        return Ufldv2OnnxLaneDetector(model_path=model_path, dataset=dataset)
+        return Ufldv2OnnxLaneDetector(model_path=model_path, dataset=dataset, lane_side_mode=lane_side_mode)
     if backend == "heuristic":
-        return FastHeuristicLaneDetector()
+        return FastHeuristicLaneDetector(lane_side_mode=lane_side_mode)
     raise ValueError(f"Unsupported lane backend: {backend}")
+
+
+def _normalize_binary_side(value: str) -> str:
+    value = value.lower().strip()
+    if value not in {"left", "right"}:
+        raise ValueError(f"default_side must be 'left' or 'right', got: {value!r}")
+    return value
 
 
 def _anchors(dataset: str, num_row: int, num_col: int) -> Tuple[np.ndarray, np.ndarray]:
