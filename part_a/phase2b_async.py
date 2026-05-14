@@ -14,7 +14,7 @@ import numpy as np
 from .calibration import CameraParams, load_calibration_from_yaml
 from .phase2b_schema import (
     DEFAULT_DEPTH_MODEL_PATH,
-    WAITING_MODEL_PATH,
+    SEG_POT_MODEL_PATH,
     Phase2BTiming,
     build_summary,
 )
@@ -35,7 +35,7 @@ class AsyncPartAPipeline:
     def __init__(
         self,
         source: Union[str, int],
-        yolo_path: str = WAITING_MODEL_PATH,
+        yolo_path: str = SEG_POT_MODEL_PATH,
         depth_path: str = DEFAULT_DEPTH_MODEL_PATH,
         output: Optional[str] = None,
         show: bool = False,
@@ -199,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue-size", type=int, default=2)
     parser.add_argument("--keep-queued-frames", action="store_true")
 
-    parser.add_argument("--yolo", default=WAITING_MODEL_PATH, help="Fine-tuned YOLOv8-seg ONNX path")
+    parser.add_argument("--yolo", default=SEG_POT_MODEL_PATH, help="Fine-tuned YOLOv8-seg ONNX path")
     parser.add_argument("--depth", default=DEFAULT_DEPTH_MODEL_PATH, help="Depth Anything ONNX path")
     parser.add_argument("--imgsz", type=int, default=416)
     parser.add_argument("--conf", type=float, default=0.25)

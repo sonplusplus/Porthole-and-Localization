@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from statistics import mean, median
 from typing import Any, Dict, List, Optional
-SEG_POT_MODEL_PATH = "waiting"
+SEG_POT_MODEL_PATH = "models/yolov8s_pothole.onnx"
 DEFAULT_DEPTH_MODEL_PATH = "models/depth_anything_v2_vits.onnx"
 @dataclass
 class Phase2BTiming:

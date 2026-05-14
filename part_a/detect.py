@@ -50,7 +50,7 @@ class YOLOSegDetector:
         self.conf = conf
         self.iou = iou
         self.device = device
-        self.model = YOLO(self.model_path)
+        self.model = YOLO(self.model_path, task="segment")
 
     def predict(self, frame: np.ndarray) -> List[SegmentationResult]:
         """Run YOLOv8-seg and return binary masks in the input frame size."""

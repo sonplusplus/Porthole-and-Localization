@@ -10,7 +10,7 @@ from .depth import DepthEstimator, PotholeMetrics
 from .detect import SegmentationResult, YOLOSegDetector
 
 
-SEG_POT_MODEL_PATH = "waiting"
+SEG_POT_MODEL_PATH = "models/yolov8s_pothole.onnx"
 DEPTH_MODEL_PATH = "models/depth_anything_v2_vits.onnx"
 
 
