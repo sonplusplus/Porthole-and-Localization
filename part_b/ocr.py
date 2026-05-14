@@ -51,5 +51,18 @@ class PaddleOcrBackend(OcrBackend):
         return OcrResult(best_text, best_score)
 
 
+class NullOcrBackend(OcrBackend):
+    name = "none"
+
+    def __init__(self, lang: str = "vi") -> None:
+        self.lang = lang
+
+    def recognize(self, image_bgr: np.ndarray) -> Optional[OcrResult]:
+        return None
+
+
 def create_ocr_backend(lang: str = "vi") -> OcrBackend:
-    return PaddleOcrBackend(lang=lang)
+    try:
+        return PaddleOcrBackend(lang=lang)
+    except ImportError:
+        return NullOcrBackend(lang=lang)

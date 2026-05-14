@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from .landmark_schema import Point3D
 from .schema import DeltaPose, GpsState, Pose2D
 
 
@@ -47,11 +48,38 @@ class LocalizationEKF:
         if gps_xy is not None and gps_state == "good":
             self._correct_gps(gps_xy, gps_noise_m=gps_noise_m)
 
+        return self.pose()
+
+    def pose(self) -> Pose2D:
         return Pose2D(
             x=float(self.x[0, 0]),
             y=float(self.x[1, 0]),
             theta=float(self.x[2, 0]),
         )
+
+    def correct_landmark(
+        self,
+        observed_landmark: Point3D,
+        reference_landmark: Point3D,
+        noise_m: Optional[float] = None,
+        match_score: float = 1.0,
+    ) -> Pose2D:
+        """Correct vehicle x/y from a matched landmark residual.
+
+        ``observed_landmark`` is the world position implied by the current pose
+        and the image observation. ``reference_landmark`` is the stored DB
+        position. Their delta is an approximate vehicle translation residual.
+        """
+
+        dx = float(reference_landmark.x - observed_landmark.x)
+        dy = float(reference_landmark.y - observed_landmark.y)
+        measurement_xy = (float(self.x[0, 0] + dx), float(self.x[1, 0] + dy))
+
+        quality = max(0.1, min(1.0, float(observed_landmark.quality or 0.35)))
+        score = max(0.1, min(1.0, float(match_score)))
+        noise = float(noise_m) if noise_m is not None else 4.0 / (quality * score)
+        self._correct_xy(measurement_xy, noise_m=noise)
+        return self.pose()
 
     def _predict(self, delta: DeltaPose) -> None:
         if not delta.valid:
@@ -81,10 +109,13 @@ class LocalizationEKF:
         self.p = f @ self.p @ f.T + q
 
     def _correct_gps(self, gps_xy: Tuple[float, float], gps_noise_m: Optional[float] = None) -> None:
-        z = np.array([[gps_xy[0]], [gps_xy[1]]], dtype=np.float64)
-        h = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
         noise = self.r_gps_noise_m if gps_noise_m is None else float(gps_noise_m)
-        noise = max(noise, 0.1)
+        self._correct_xy(gps_xy, noise_m=noise)
+
+    def _correct_xy(self, xy: Tuple[float, float], noise_m: float) -> None:
+        z = np.array([[xy[0]], [xy[1]]], dtype=np.float64)
+        h = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+        noise = max(float(noise_m), 0.1)
         r = np.diag([noise * noise, noise * noise]).astype(np.float64)
         y = z - h @ self.x
         s = h @ self.p @ h.T + r

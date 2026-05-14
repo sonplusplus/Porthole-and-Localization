@@ -5,12 +5,16 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
+from .detector import Phase4LandmarkDetector
 from .events import UTurnDetector
 from .fusion import LocalizationEKF
+from .ghost_projection import project_landmark, reprojection_error_px
 from .gps import GpsIntegrityMonitor
 from .kitti import KittiRawSequence, discover_kitti_sequences
 from .lane import create_lane_detector
-from .schema import Phase3Output, Pose2D, ground_delta_from_points
+from .landmark_db import LandmarkDatabase
+from .ocr import create_ocr_backend
+from .schema import LaneEstimate, Phase3Output, Pose2D, ground_delta_from_points
 from .vo import OrbVisualOdometry
 from .handover import GpsHandoverManager, GpsLossSimulator
 
@@ -21,9 +25,14 @@ def run_sequence(
     output: str,
     camera: str = "image_02",
     max_frames: Optional[int] = None,
-    lane_backend: str = "ufldv2",
+    lane_backend: str = "heuristic",
     lane_model: str = "models/ufldv2_culane_res34.onnx",
     lane_dataset: str = "culane",
+    lane_every_n: int = 3,
+    landmark_db_path: Optional[str] = None,
+    landmark_every_n: int = 5,
+    landmark_ocr_lang: str = "vi",
+    landmark_reprojection_gate_px: float = 160.0,
     gps_loss_start: Optional[int] = None,
     gps_loss_end: Optional[int] = None,
     gps_loss_degraded_frames: int = 5,
@@ -40,6 +49,15 @@ def run_sequence(
         degraded_frames=gps_loss_degraded_frames,
     )
     handover_manager = GpsHandoverManager()
+    landmark_db = None
+    landmark_detector = None
+    if landmark_db_path:
+        landmark_db = LandmarkDatabase.from_jsonl(seq.sequence_id, landmark_db_path)
+        landmark_detector = Phase4LandmarkDetector(
+            camera_fx=seq.camera_params.fx,
+            camera_cx=seq.camera_params.cx,
+            ocr=create_ocr_backend(lang=landmark_ocr_lang),
+        )
 
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +77,15 @@ def run_sequence(
     relock_errors = []
     max_loss_error = 0.0
     prev_fused_pose = Pose2D(x=0.0, y=0.0, theta=0.0)
+    lane_every_n = max(1, int(lane_every_n))
+    landmark_every_n = max(1, int(landmark_every_n))
+    last_lane: Optional[LaneEstimate] = None
+    landmark_observations = 0
+    landmark_matches = 0
+    landmark_corrections = 0
+    landmark_projected = 0
+    landmark_reprojection_rejected = 0
+    landmark_reprojection_errors = []
     try:
         with out_path.open("w", encoding="utf-8") as f:
             for sample in seq.iter_samples(max_frames=max_frames):
@@ -72,8 +99,13 @@ def run_sequence(
                 vo_ms.append((time.perf_counter() - t0) * 1000.0)
 
                 t0 = time.perf_counter()
-                lane = lane_detector.estimate(sample.frame)
-                lane_ms.append((time.perf_counter() - t0) * 1000.0)
+                if last_lane is None or count % lane_every_n == 0:
+                    lane = lane_detector.estimate(sample.frame)
+                    last_lane = lane
+                    lane_ms.append((time.perf_counter() - t0) * 1000.0)
+                else:
+                    lane = last_lane
+                    lane_ms.append(0.0)
 
                 t0 = time.perf_counter()
                 gps_state = gps_monitor.update(gps_sample)
@@ -90,6 +122,40 @@ def run_sequence(
                     gps_state,
                     gps_noise_m=handover.gps_correction_noise_m,
                 )
+                if landmark_db is not None and landmark_detector is not None and count % landmark_every_n == 0:
+                    detected_landmarks = landmark_detector.detect(
+                        frame=sample.frame,
+                        pose=fused_pose,
+                        sequence_id=seq.sequence_id,
+                        frame_index=sample.meta.frame_index,
+                        timestamp=sample.meta.timestamp,
+                    )
+                    landmark_observations += len(detected_landmarks)
+                    for obs in detected_landmarks:
+                        match = landmark_db.find_best_match(obs)
+                        if match is not None:
+                            landmark_matches += 1
+                            record = landmark_db.records[match.landmark_id]
+                            frame_h, frame_w = sample.frame.shape[:2]
+                            projection = project_landmark(
+                                record=record,
+                                pose=fused_pose,
+                                camera_fx=seq.camera_params.fx,
+                                camera_cx=seq.camera_params.cx,
+                                image_width=frame_w,
+                                image_height=frame_h,
+                            )
+                            if projection is not None:
+                                landmark_projected += 1
+                                error_px = reprojection_error_px(projection, obs.bbox_xyxy)
+                                landmark_reprojection_errors.append(error_px)
+                                if landmark_reprojection_gate_px > 0 and error_px > landmark_reprojection_gate_px:
+                                    landmark_reprojection_rejected += 1
+                                    landmark_db.upsert(obs)
+                                    continue
+                            fused_pose = ekf.correct_landmark(obs.p_3D, record.p_3D, match_score=match.score)
+                            landmark_corrections += 1
+                        landmark_db.upsert(obs)
                 event_estimate = events.update(sample.meta.timestamp, fused_pose)
                 fusion_ms.append((time.perf_counter() - t0) * 1000.0)
 
@@ -133,6 +199,22 @@ def run_sequence(
         "lane_backend": lane_backend,
         "lane_model": lane_model,
         "lane_dataset": lane_dataset,
+        "lane_every_n": lane_every_n,
+        "landmarks": {
+            "enabled": landmark_db_path is not None,
+            "db_path": landmark_db_path,
+            "every_n": landmark_every_n,
+            "observations": landmark_observations,
+            "matches": landmark_matches,
+            "corrections": landmark_corrections,
+            "ghost_projection": {
+                "projected": landmark_projected,
+                "rejected_by_gate": landmark_reprojection_rejected,
+                "gate_px": landmark_reprojection_gate_px,
+                "avg_reprojection_error_px": _mean(landmark_reprojection_errors),
+                "p95_reprojection_error_px": _percentile(landmark_reprojection_errors, 0.95),
+            },
+        },
         "gps_state_counts": gps_state_counts,
         "gps_loss_simulation": {
             "enabled": gps_loss.enabled,
@@ -217,9 +299,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", default="image_02", choices=["image_02", "image_03"])
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--output", default=None, help="Output JSONL path")
-    parser.add_argument("--lane-backend", default="ufldv2", choices=["ufldv2", "heuristic"])
+    parser.add_argument("--lane-backend", default="heuristic", choices=["ufldv2", "heuristic"])
     parser.add_argument("--lane-model", default="models/ufldv2_culane_res34.onnx", help="UFLDv2 ONNX lane model")
     parser.add_argument("--lane-dataset", default="culane", choices=["culane", "tusimple", "curvelanes"])
+    parser.add_argument("--lane-every-n", type=int, default=3, help="Run lane inference once every N processed frames")
+    parser.add_argument("--landmark-db", default=None, help="Optional Phase 4 landmark JSONL for EKF landmark correction")
+    parser.add_argument("--landmark-every-n", type=int, default=5, help="Run landmark detection/correction once every N frames")
+    parser.add_argument("--landmark-ocr-lang", default="vi")
+    parser.add_argument(
+        "--landmark-reprojection-gate-px",
+        type=float,
+        default=160.0,
+        help="Reject landmark EKF corrections whose ghost projection error exceeds this many pixels; use 0 to disable",
+    )
     parser.add_argument("--gps-loss-start", type=int, default=None, help="First frame to simulate degraded/lost GPS")
     parser.add_argument("--gps-loss-end", type=int, default=None, help="Last frame to simulate degraded/lost GPS")
     parser.add_argument("--gps-loss-degraded-frames", type=int, default=5, help="Frames kept degraded before GPS is lost")
@@ -240,6 +332,11 @@ def main() -> None:
         lane_backend=args.lane_backend,
         lane_model=args.lane_model,
         lane_dataset=args.lane_dataset,
+        lane_every_n=args.lane_every_n,
+        landmark_db_path=args.landmark_db,
+        landmark_every_n=args.landmark_every_n,
+        landmark_ocr_lang=args.landmark_ocr_lang,
+        landmark_reprojection_gate_px=args.landmark_reprojection_gate_px,
         gps_loss_start=args.gps_loss_start,
         gps_loss_end=args.gps_loss_end,
         gps_loss_degraded_frames=args.gps_loss_degraded_frames,
