@@ -35,8 +35,9 @@ class DepthEstimator:
     _INPUT_H = 518
     _INPUT_W = 518
 
-    # Severity thresholds — tính theo area_ratio (mask / frame)
-    _SEV_THRESH = [(0.005, "minor", 0), (0.025, "moderate", 1)]
+    # Default severity thresholds use area_ratio for backward compatibility.
+    _SEV_THRESH_RATIO = [(0.005, "minor", 0), (0.025, "moderate", 1)]
+    _SEV_THRESH_M2 = [(0.02, "minor", 0), (0.08, "moderate", 1)]
 
     def __init__(
         self,
@@ -159,6 +160,7 @@ class DepthEstimator:
         frame: np.ndarray,
         mask: np.ndarray,               
         depth_metric: Optional[np.ndarray] = None,
+        severity_mode: str = "area_ratio",
     ) -> PotholeMetrics:
         if depth_metric is None:
             depth_metric = self.infer_metric(frame)
@@ -196,7 +198,7 @@ class DepthEstimator:
         else:
             centroid_xy = (0.0, 0.0)
 
-        severity, sev_idx = self._classify_severity(area_ratio)
+        severity, sev_idx = self._classify_severity(area_ratio, area_m2, severity_mode)
 
         return PotholeMetrics(
             depth_m      = depth_mean,
@@ -275,9 +277,18 @@ class DepthEstimator:
         return best_a, best_b
 
     @classmethod
-    def _classify_severity(cls, area_ratio: float) -> Tuple[str, int]:
-        for thresh, label, idx in cls._SEV_THRESH:
-            if area_ratio < thresh:
+    def _classify_severity(cls, area_ratio: float, area_m2: float, mode: str = "area_ratio") -> Tuple[str, int]:
+        if mode == "area_m2":
+            value = area_m2
+            thresholds = cls._SEV_THRESH_M2
+        elif mode == "area_ratio":
+            value = area_ratio
+            thresholds = cls._SEV_THRESH_RATIO
+        else:
+            raise ValueError(f"Unsupported severity_mode: {mode}")
+
+        for thresh, label, idx in thresholds:
+            if value < thresh:
                 return label, idx
         return "severe", 2
 

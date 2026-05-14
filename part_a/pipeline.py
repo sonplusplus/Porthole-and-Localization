@@ -37,9 +37,11 @@ class PotholePipeline:
         yolo_path: str = SEG_POT_MODEL_PATH,
         depth_path: str = DEPTH_MODEL_PATH,
         cam: Optional[CameraParams] = None,
-        imgsz: int = 416,
+        imgsz: int = 448,
         conf: float = 0.25,
         iou: float = 0.45,
+        depth_every_n: int = 4,
+        severity_mode: str = "area_ratio",
     ):
         if cam is None:
             warnings.warn(
@@ -63,6 +65,10 @@ class PotholePipeline:
         else:
             self.cam = cam
         self.ipm = IPMTransformer(self.cam)
+        self.depth_every_n = max(1, int(depth_every_n))
+        self.severity_mode = severity_mode
+        self._frame_index = 0
+        self._cached_depth_metric: Optional[np.ndarray] = None
         self.detector = YOLOSegDetector(
             model_path=yolo_path,
             imgsz=imgsz,
@@ -73,6 +79,8 @@ class PotholePipeline:
         self.depth = DepthEstimator(depth_path, self.cam, self.ipm)
 
     def process_frame(self, frame: np.ndarray) -> PipelineOutput:
+        frame_index = self._frame_index
+        self._frame_index += 1
         t0 = time.perf_counter()
 
         t_det0 = time.perf_counter()
@@ -83,14 +91,29 @@ class PotholePipeline:
         depth_ms = 0.0
         depth_metric = None
 
-        # Depth is expensive, so run it only when segmentation finds potholes.
+        # Depth is expensive, so run it only when segmentation finds potholes
+        # and refresh the metric map every N frames.
         if detections:
-            t_depth0 = time.perf_counter()
-            depth_metric = self.depth.infer_metric(frame)
-            depth_ms = (time.perf_counter() - t_depth0) * 1000
+            refresh_depth = (
+                self._cached_depth_metric is None
+                or self._cached_depth_metric.shape[:2] != frame.shape[:2]
+                or frame_index % self.depth_every_n == 0
+            )
+            if refresh_depth:
+                t_depth0 = time.perf_counter()
+                depth_metric = self.depth.infer_metric(frame)
+                depth_ms = (time.perf_counter() - t_depth0) * 1000
+                self._cached_depth_metric = depth_metric
+            else:
+                depth_metric = self._cached_depth_metric
 
             for det in detections:
-                metrics = self.depth.estimate_pothole(frame, det.mask, depth_metric)
+                metrics = self.depth.estimate_pothole(
+                    frame,
+                    det.mask,
+                    depth_metric,
+                    severity_mode=self.severity_mode,
+                )
                 observations.append(PotholeObservation(det, metrics))
 
         out = draw_observations(frame, observations)
@@ -289,9 +312,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--yolo", default=SEG_POT_MODEL_PATH, help="Fine-tuned YOLOv8-seg .onnx/.pt")
     parser.add_argument("--depth", default=DEPTH_MODEL_PATH, help="Depth Anything ONNX model")
-    parser.add_argument("--imgsz", type=int, default=416)
+    parser.add_argument("--imgsz", type=int, default=448)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--depth-every-n", type=int, default=4, help="Run depth inference once every N processed frames")
+    parser.add_argument("--severity-mode", default="area_ratio", choices=["area_ratio", "area_m2"])
 
     parser.add_argument("--calib", default=None, help="Optional camera calibration YAML")
     parser.add_argument("--fx", type=float, default=800.0)
@@ -315,6 +340,8 @@ def main() -> None:
         imgsz=args.imgsz,
         conf=args.conf,
         iou=args.iou,
+        depth_every_n=args.depth_every_n,
+        severity_mode=args.severity_mode,
     )
 
     if is_image_path(args.source):

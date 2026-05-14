@@ -35,14 +35,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", required=True, help="Video path or webcam index, e.g. 0")
     parser.add_argument("--summary", default="data/phase2b_outputs/benchmark_summary.json")
     parser.add_argument("--output", default=None, help="Optional rendered benchmark video")
-    parser.add_argument("--max-frames", type=int, default=300)
+    parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--queue-size", type=int, default=2)
+    parser.add_argument("--process-all-frames", action="store_true", help="Process frames sequentially without realtime dropping")
 
     parser.add_argument("--yolo", default=SEG_POT_MODEL_PATH, help="Fine-tuned YOLOv8-seg ONNX path")
     parser.add_argument("--depth", default=DEFAULT_DEPTH_MODEL_PATH, help="Depth Anything ONNX path")
-    parser.add_argument("--imgsz", type=int, default=416)
+    parser.add_argument("--imgsz", type=int, default=448)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--depth-every-n", type=int, default=4, help="Run depth inference once every N processed frames")
+    parser.add_argument("--severity-mode", default="area_ratio", choices=["area_ratio", "area_m2"])
 
     parser.add_argument("--calib", default=None)
     parser.add_argument("--fx", type=float, default=800.0)
@@ -66,10 +69,13 @@ def main() -> None:
         show=False,
         max_frames=args.max_frames,
         queue_size=args.queue_size,
+        process_all_frames=args.process_all_frames,
         imgsz=args.imgsz,
         conf=args.conf,
         iou=args.iou,
         cam=load_camera(args),
+        depth_every_n=args.depth_every_n,
+        severity_mode=args.severity_mode,
     )
     summary = runner.run()
 

@@ -24,7 +24,7 @@ class YOLOSegDetector:
     def __init__(
         self,
         model_path: str = "models/yolov8s_pothole.onnx",
-        imgsz: int = 416,
+        imgsz: int = 448,
         conf: float = 0.25,
         iou: float = 0.45,
         device: str = "cpu",

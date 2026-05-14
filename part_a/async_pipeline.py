@@ -43,10 +43,13 @@ class AsyncPartAPipeline:
         max_frames: Optional[int] = None,
         queue_size: int = 2,
         drop_old_frames: bool = True,
-        imgsz: int = 416,
+        process_all_frames: bool = False,
+        imgsz: int = 448,
         conf: float = 0.25,
         iou: float = 0.45,
         cam: Optional[CameraParams] = None,
+        depth_every_n: int = 4,
+        severity_mode: str = "area_ratio",
     ):
         self.source = source
         self.yolo_path = yolo_path
@@ -55,6 +58,7 @@ class AsyncPartAPipeline:
         self.show = show
         self.max_frames = max_frames
         self.drop_old_frames = drop_old_frames
+        self.process_all_frames = process_all_frames
         self.frame_queue: queue.Queue[Optional[FramePacket]] = queue.Queue(maxsize=queue_size)
         self.timings: List[Phase2BTiming] = []
         self.frames_read = 0
@@ -69,6 +73,8 @@ class AsyncPartAPipeline:
             imgsz=imgsz,
             conf=conf,
             iou=iou,
+            depth_every_n=depth_every_n,
+            severity_mode=severity_mode,
         )
 
     def run(self) -> dict:
@@ -77,44 +83,23 @@ class AsyncPartAPipeline:
             raise FileNotFoundError(f"Could not open video source: {self.source}")
 
         writer = self._make_writer(cap)
-        capture_thread = threading.Thread(target=self._capture_loop, args=(cap,), daemon=True)
-        capture_thread.start()
-
         try:
-            while True:
-                packet = self.frame_queue.get()
-                if packet is None:
-                    break
-
-                t0 = time.perf_counter()
-                result = self.pipeline.process_frame(packet.frame)
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-                if writer is not None:
-                    writer.write(result.frame)
-
-                if self.show:
-                    cv2.imshow("phase2b async pothole pipeline", result.frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        self._stop.set()
-                        break
-
-                self.timings.append(
-                    Phase2BTiming(
-                        frame_index=packet.index,
-                        capture_ts=packet.capture_ts,
-                        end_to_end_ms=elapsed_ms,
-                        detect_ms=result.detect_ms,
-                        depth_ms=result.depth_ms,
-                        fps=result.fps,
-                        pothole_count=len(result.observations),
-                        queue_size=self.frame_queue.qsize(),
-                        memory_mb=self._memory_mb(),
-                    )
-                )
+            if self.process_all_frames:
+                self._run_sequential(cap, writer)
+            else:
+                capture_thread = threading.Thread(target=self._capture_loop, args=(cap,), daemon=True)
+                capture_thread.start()
+                try:
+                    while True:
+                        packet = self.frame_queue.get()
+                        if packet is None:
+                            break
+                        if not self._process_packet(packet, writer):
+                            break
+                finally:
+                    capture_thread.join(timeout=2.0)
         finally:
             self._stop.set()
-            capture_thread.join(timeout=2.0)
             cap.release()
             if writer is not None:
                 writer.release()
@@ -128,6 +113,53 @@ class AsyncPartAPipeline:
             model_path=self.yolo_path,
             depth_model_path=self.depth_path,
         ).to_dict()
+
+    def _run_sequential(self, cap: cv2.VideoCapture, writer: Optional[cv2.VideoWriter]) -> None:
+        while not self._stop.is_set():
+            if self.max_frames is not None and self.frames_read >= self.max_frames:
+                break
+
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            packet = FramePacket(
+                index=self.frames_read,
+                capture_ts=time.time(),
+                frame=frame,
+            )
+            self.frames_read += 1
+            if not self._process_packet(packet, writer):
+                break
+
+    def _process_packet(self, packet: FramePacket, writer: Optional[cv2.VideoWriter]) -> bool:
+        t0 = time.perf_counter()
+        result = self.pipeline.process_frame(packet.frame)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        if writer is not None:
+            writer.write(result.frame)
+
+        if self.show:
+            cv2.imshow("phase2b async pothole pipeline", result.frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                self._stop.set()
+                return False
+
+        self.timings.append(
+            Phase2BTiming(
+                frame_index=packet.index,
+                capture_ts=packet.capture_ts,
+                end_to_end_ms=elapsed_ms,
+                detect_ms=result.detect_ms,
+                depth_ms=result.depth_ms,
+                fps=result.fps,
+                pothole_count=len(result.observations),
+                queue_size=self.frame_queue.qsize(),
+                memory_mb=self._memory_mb(),
+            )
+        )
+        return True
 
     def _capture_loop(self, cap: cv2.VideoCapture) -> None:
         while not self._stop.is_set():
@@ -204,12 +236,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--queue-size", type=int, default=2)
     parser.add_argument("--keep-queued-frames", action="store_true")
+    parser.add_argument("--process-all-frames", action="store_true", help="Process video frames sequentially without realtime dropping")
 
     parser.add_argument("--yolo", default=SEG_POT_MODEL_PATH, help="Fine-tuned YOLOv8-seg ONNX path")
     parser.add_argument("--depth", default=DEFAULT_DEPTH_MODEL_PATH, help="Depth Anything ONNX path")
-    parser.add_argument("--imgsz", type=int, default=416)
+    parser.add_argument("--imgsz", type=int, default=448)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--depth-every-n", type=int, default=4, help="Run depth inference once every N processed frames")
+    parser.add_argument("--severity-mode", default="area_ratio", choices=["area_ratio", "area_m2"])
 
     parser.add_argument("--calib", default=None, help="Optional camera calibration YAML")
     parser.add_argument("--fx", type=float, default=800.0)
@@ -238,10 +273,13 @@ def main() -> None:
         max_frames=args.max_frames,
         queue_size=args.queue_size,
         drop_old_frames=not args.keep_queued_frames,
+        process_all_frames=args.process_all_frames,
         imgsz=args.imgsz,
         conf=args.conf,
         iou=args.iou,
         cam=load_camera(args),
+        depth_every_n=args.depth_every_n,
+        severity_mode=args.severity_mode,
     )
     summary = runner.run()
     print(json.dumps(summary, indent=2))
