@@ -8,3 +8,5 @@ update.md
 bugs.md
 report.md
 /__pycache__
+__pycache__/
+*.py[cod]
