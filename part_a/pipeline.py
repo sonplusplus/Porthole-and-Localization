@@ -1,5 +1,6 @@
 import argparse
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -40,16 +41,27 @@ class PotholePipeline:
         conf: float = 0.25,
         iou: float = 0.45,
     ):
-        self.cam = cam or CameraParams(
-            fx=800,
-            fy=800,
-            cx=640,
-            cy=360,
-            width=1280,
-            height=720,
-            h_camera=1.2,
-            pitch=np.deg2rad(5),
-        )
+        if cam is None:
+            warnings.warn(
+                "No CameraParams provided to PotholePipeline. Using placeholder values "
+                "(fx=800, fy=800, cx=640, cy=360, h_camera=1.2m, pitch=5deg). "
+                "Metric area_m2 and depth_m outputs will be unreliable for real cameras. "
+                "Pass --calib or construct CameraParams from measured camera specs.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.cam = CameraParams(
+                fx=800,
+                fy=800,
+                cx=640,
+                cy=360,
+                width=1280,
+                height=720,
+                h_camera=1.2,
+                pitch=np.deg2rad(5),
+            )
+        else:
+            self.cam = cam
         self.ipm = IPMTransformer(self.cam)
         self.detector = YOLOSegDetector(
             model_path=yolo_path,
@@ -179,6 +191,11 @@ def draw_label(
 def load_camera(args: argparse.Namespace) -> CameraParams:
     if args.calib:
         return load_calibration_from_yaml(args.calib)
+    warnings.warn(
+        "Running without --calib. Metric depth/area results are approximate only.",
+        UserWarning,
+        stacklevel=2,
+    )
     return CameraParams(
         fx=args.fx,
         fy=args.fy,

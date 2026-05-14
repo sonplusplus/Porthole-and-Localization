@@ -1,4 +1,5 @@
 import cv2
+import math
 import numpy as np
 import onnxruntime as ort
 from dataclasses import dataclass
@@ -108,8 +109,13 @@ class DepthEstimator:
         """
         H, W = frame_shape
 
-        #pixel angle
-        v_start = int(H * 0.75)
+        # Start ground sampling below the horizon implied by camera pitch.
+        # This keeps sky/traffic near the horizon out of the metric scale fit.
+        v_horizon = self.cam.cy - self.cam.fy * math.tan(self.cam.pitch)
+        v_horizon = float(np.clip(v_horizon, 0, H - 1))
+        v_ground_top = v_horizon + 0.8 * (H - v_horizon)
+        v_start = int(np.clip(v_ground_top, H * 0.5, max(H - 10, 0)))
+
         vs = np.arange(v_start, H).astype(np.float32)
         pixel_angles = np.arctan((vs - self.cam.cy) / self.cam.fy)
         total_angles = self.cam.pitch + pixel_angles
@@ -121,8 +127,12 @@ class DepthEstimator:
                         np.nan)
         Z_gt = np.clip(Z_gt, 0.5, 50.0)
 
-        # Depth values trong ground strip
-        depth_strip = depth_rel[v_start:, W // 4: 3 * W // 4]
+        # Depth values trong ground strip. Crop horizontal edges to avoid kerbs,
+        # adjacent vehicles, and image borders dominating the fit.
+        h_margin = W // 6
+        c0 = min(h_margin, max(W - 1, 0))
+        c1 = max(c0 + 1, W - h_margin)
+        depth_strip = depth_rel[v_start:, c0:c1]
         Z_gt_strip  = Z_gt[:, None].repeat(depth_strip.shape[1], axis=1)
 
         d_flat = depth_strip.ravel()

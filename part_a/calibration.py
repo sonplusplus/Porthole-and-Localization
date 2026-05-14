@@ -38,19 +38,10 @@ class CameraParams:
 
 class IPMTransformer:
     """
-    Inverse Perspective Mapping — chuyển ảnh camera → Bird's-Eye View (BEV).
-
     Coordinate system BEV:
         - Origin = điểm ngay dưới camera trên mặt đường
-        - +X = bên phải xe (m)
-        - +Y = phía trước xe (m)
-    Usage:
-        cam   = CameraParams(fx=800, fy=800, cx=640, cy=360,
-                             h_camera=1.2, pitch=np.deg2rad(5))
-        ipm   = IPMTransformer(cam)
-        bev   = ipm.warp(frame)                     # BEV image
-        m_per_px = ipm.meters_per_pixel             # (mx, my) tuple
-        area_m2  = ipm.pixel_area_to_m2(mask_bev)  # float
+        - +X = right 
+        - +Y = forward 
     """
 
     # BEV output canvas (pixels)

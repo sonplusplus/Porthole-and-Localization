@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Union
@@ -12,7 +13,7 @@ import cv2
 import numpy as np
 
 from .calibration import CameraParams, load_calibration_from_yaml
-from .phase2b_schema import (
+from .schema import (
     DEFAULT_DEPTH_MODEL_PATH,
     SEG_POT_MODEL_PATH,
     Phase2BTiming,
@@ -177,6 +178,11 @@ class AsyncPartAPipeline:
 def load_camera(args: argparse.Namespace) -> CameraParams:
     if args.calib:
         return load_calibration_from_yaml(args.calib)
+    warnings.warn(
+        "Running without --calib. Metric depth/area results are approximate only.",
+        UserWarning,
+        stacklevel=2,
+    )
     return CameraParams(
         fx=args.fx,
         fy=args.fy,

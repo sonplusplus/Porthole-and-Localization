@@ -9,8 +9,6 @@ from ultralytics import YOLO
 
 @dataclass
 class SegmentationResult:
-    """One YOLOv8-seg pothole instance in the original frame space."""
-
     mask: np.ndarray
     bbox_xyxy: Tuple[int, int, int, int]
     conf: float

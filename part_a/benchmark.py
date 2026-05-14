@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
 
 from .calibration import CameraParams, load_calibration_from_yaml
-from .phase2b_async import AsyncPartAPipeline, parse_source
-from .phase2b_schema import DEFAULT_DEPTH_MODEL_PATH, SEG_POT_MODEL_PATH
+from .async_pipeline import AsyncPartAPipeline, parse_source
+from .schema import DEFAULT_DEPTH_MODEL_PATH, SEG_POT_MODEL_PATH
 
 def load_camera(args: argparse.Namespace) -> CameraParams:
     if args.calib:
         return load_calibration_from_yaml(args.calib)
+    warnings.warn(
+        "Running without --calib. Metric depth/area results are approximate only.",
+        UserWarning,
+        stacklevel=2,
+    )
     return CameraParams(
         fx=args.fx,
         fy=args.fy,
