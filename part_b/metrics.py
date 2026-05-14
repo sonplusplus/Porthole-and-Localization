@@ -43,6 +43,7 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     vo_valid = [bool(_get(row, ("delta_pose", "valid"), False)) for row in rows]
     vo_matches = [_get_float(row, ("delta_pose", "matches")) for row in rows]
     vo_inliers = [_get_float(row, ("delta_pose", "inliers")) for row in rows]
+    vo_scale_sources = Counter(_get(row, ("vo_scale_source",), "unknown") for row in rows)
     lane_conf = [_get_float(row, ("lane", "confidence")) for row in rows]
     heading_delta = [_get_float(row, ("events", "heading_delta_deg")) for row in rows]
     handover_modes = Counter(_get(row, ("handover", "mode"), "unknown") for row in rows)
@@ -104,6 +105,7 @@ def compute_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_vo_inliers": _safe_mean(vo_inliers),
         "p50_vo_inliers": _percentile(vo_inliers, 0.50),
         "p95_vo_inliers": _percentile(vo_inliers, 0.95),
+        "vo_scale_source_counts": dict(vo_scale_sources),
         "gps_path_length_m": _path_length(gps_points),
         "vo_path_length_m": _path_length(vo_points),
         "fused_path_length_m": _path_length(fused_points),

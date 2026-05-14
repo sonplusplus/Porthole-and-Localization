@@ -3,7 +3,7 @@ import json
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from .detector import Phase4LandmarkDetector
 from .events import UTurnDetector
@@ -62,7 +62,13 @@ def run_sequence(
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    prev_xy = None
+    prev_scale_xy: Optional[Tuple[float, float]] = None
+    last_good_scale_hint = 0.0
+    vo_scale_source_counts = {
+        "gps_good": 0,
+        "last_good_gps_scale": 0,
+        "unit_fallback": 0,
+    }
     count = 0
     gps_state_counts = {"good": 0, "degraded": 0, "lost": 0}
     lane_counts = {"left": 0, "right": 0, "center": 0, "unknown": 0}
@@ -90,9 +96,20 @@ def run_sequence(
         with out_path.open("w", encoding="utf-8") as f:
             for sample in seq.iter_samples(max_frames=max_frames):
                 frame_t0 = time.perf_counter()
-                scale_hint = ground_delta_from_points(prev_xy, sample.local_xy)
                 gps_sample = gps_loss.apply(sample.meta.gps, sample.meta.frame_index)
                 sample_meta = replace(sample.meta, gps=gps_sample)
+                gps_state = gps_monitor.update(gps_sample)
+                (
+                    scale_hint,
+                    scale_source,
+                    prev_scale_xy,
+                    last_good_scale_hint,
+                ) = _vo_scale_hint(
+                    gps_state=gps_state,
+                    curr_xy=sample.local_xy,
+                    prev_good_xy=prev_scale_xy,
+                    last_good_scale_hint=last_good_scale_hint,
+                )
 
                 t0 = time.perf_counter()
                 pose, delta = vo.update(sample.frame, scale_hint=scale_hint)
@@ -108,7 +125,6 @@ def run_sequence(
                     lane_ms.append(0.0)
 
                 t0 = time.perf_counter()
-                gps_state = gps_monitor.update(gps_sample)
                 handover = handover_manager.update(
                     gps=gps_sample,
                     gps_xy=sample.local_xy,
@@ -169,11 +185,13 @@ def run_sequence(
                     gps_state=gps_state,
                     events=event_estimate,
                     handover=handover,
+                    vo_scale_source=scale_source,
+                    vo_scale_hint_m=scale_hint,
                 )
                 f.write(json.dumps(row.to_jsonable(), ensure_ascii=False) + "\n")
-                prev_xy = sample.local_xy
                 prev_fused_pose = fused_pose
                 count += 1
+                vo_scale_source_counts[scale_source] = vo_scale_source_counts.get(scale_source, 0) + 1
                 gps_state_counts[gps_state] += 1
                 if handover.transition:
                     handover_transitions[handover.transition] = handover_transitions.get(handover.transition, 0) + 1
@@ -221,6 +239,11 @@ def run_sequence(
             "start_frame": gps_loss_start,
             "end_frame": gps_loss_end,
             "degraded_frames": gps_loss_degraded_frames,
+        },
+        "vo_scale": {
+            "policy": "Use GPS local delta only while GPS state is good; degraded/lost frames use the last good scale hint, then unit fallback.",
+            "source_counts": vo_scale_source_counts,
+            "last_good_scale_hint_m": last_good_scale_hint,
         },
         "handover_transitions": handover_transitions,
         "max_visual_fallback_error_m": max_loss_error,
@@ -288,6 +311,31 @@ def _percentile(values, q: float):
     upper = min(lower + 1, len(clean) - 1)
     weight = position - lower
     return float(clean[lower] * (1.0 - weight) + clean[upper] * weight)
+
+
+def _vo_scale_hint(
+    gps_state: str,
+    curr_xy: Optional[Tuple[float, float]],
+    prev_good_xy: Optional[Tuple[float, float]],
+    last_good_scale_hint: float,
+) -> Tuple[float, str, Optional[Tuple[float, float]], float]:
+    """Return an honest monocular VO scale hint for GPS-loss experiments.
+
+    KITTI still has hidden ground-truth GPS local XY even when we simulate GPS
+    loss. Only using that delta while GPS is good prevents the handover artifact
+    from quietly benefiting from the answer key during degraded/lost frames.
+    """
+
+    if gps_state == "good" and curr_xy is not None:
+        scale_hint = ground_delta_from_points(prev_good_xy, curr_xy)
+        if scale_hint > 0.01:
+            last_good_scale_hint = scale_hint
+        return scale_hint, "gps_good", curr_xy, last_good_scale_hint
+
+    if last_good_scale_hint > 0.01:
+        return last_good_scale_hint, "last_good_gps_scale", prev_good_xy, last_good_scale_hint
+
+    return 0.0, "unit_fallback", prev_good_xy, last_good_scale_hint
 
 
 def parse_args() -> argparse.Namespace:

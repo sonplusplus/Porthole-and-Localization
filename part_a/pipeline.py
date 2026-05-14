@@ -160,7 +160,7 @@ def draw_observations(
 
         label = (
             f"{metrics.severity} {det.conf:.2f} | "
-            f"area {metrics.area_m2:.3f}m2 | rel {metrics.depth_rel:.2f}"
+            f"area {metrics.area_m2:.3f}m2 | drop {metrics.depth_delta_m:.2f}m"
         )
         draw_label(out, label, x1, max(20, y1 - 8), color)
 
@@ -295,7 +295,8 @@ def print_observations(result: PipelineOutput) -> None:
         d = obs.detection
         print(
             f"#{i}: conf={d.conf:.3f}, severity={m.severity}, "
-            f"area={m.area_m2:.4f}m2, depth_rel={m.depth_rel:.3f}, "
+            f"area={m.area_m2:.4f}m2, depth_delta={m.depth_delta_m:.3f}m, "
+            f"depth_rel={m.depth_rel:.3f}, "
             f"centroid=({m.centroid_xy[0]:.2f}, {m.centroid_xy[1]:.2f})"
         )
 

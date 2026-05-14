@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", required=True, help="Video path or webcam index, e.g. 0")
     parser.add_argument("--summary", default="data/phase2b_outputs/benchmark_summary.json")
     parser.add_argument("--output", default=None, help="Optional rendered benchmark video")
+    parser.add_argument("--detections", default=None, help="Optional JSONL path for per-detection depth/area records")
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--queue-size", type=int, default=2)
     parser.add_argument("--process-all-frames", action="store_true", help="Process frames sequentially without realtime dropping")
@@ -66,6 +67,7 @@ def main() -> None:
         yolo_path=args.yolo,
         depth_path=args.depth,
         output=args.output,
+        detections_output=args.detections,
         show=False,
         max_frames=args.max_frames,
         queue_size=args.queue_size,

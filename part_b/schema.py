@@ -107,6 +107,8 @@ class Phase3Output:
     gps_state: GpsState
     events: EventEstimate
     handover: Optional[HandoverEstimate] = None
+    vo_scale_source: Optional[str] = None
+    vo_scale_hint_m: Optional[float] = None
 
     def to_jsonable(self) -> Dict[str, Any]:
         return asdict(self)

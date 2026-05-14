@@ -9,7 +9,8 @@ from .calibration import CameraParams, IPMTransformer
 
 @dataclass
 class PotholeMetrics:
-    depth_m:      float        
+    depth_m:      float
+    depth_delta_m: float       # metric difference between pothole and surrounding road
     depth_rel:    float        # độ sâu tương đối so với mặt đường xung quanh [0–1]
     area_m2:      float        
     area_ratio:   float        # tỷ lệ diện tích / khu vực ROI
@@ -173,7 +174,7 @@ class DepthEstimator:
 
         depth_in_mask = depth_metric[bin_mask == 1]
         if len(depth_in_mask) == 0:
-            return PotholeMetrics(0, 0, 0, 0, "minor", 0, (0.0, 0.0))
+            return PotholeMetrics(0, 0, 0, 0, 0, "minor", 0, (0.0, 0.0))
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
         dilated  = cv2.dilate(bin_mask, kernel)
@@ -184,7 +185,8 @@ class DepthEstimator:
                      else float(np.median(depth_in_mask)) * 0.9
 
         depth_mean = float(np.mean(depth_in_mask))
-        depth_rel_val = abs(road_depth - depth_mean) / (road_depth + 1e-6)
+        depth_delta_m = abs(road_depth - depth_mean)
+        depth_rel_val = depth_delta_m / (road_depth + 1e-6)
 
         mask_bev = self.ipm.warp_mask(bin_mask)
         area_m2  = self.ipm.pixel_area_to_m2(mask_bev)
@@ -202,6 +204,7 @@ class DepthEstimator:
 
         return PotholeMetrics(
             depth_m      = depth_mean,
+            depth_delta_m= depth_delta_m,
             depth_rel    = depth_rel_val,
             area_m2      = area_m2,
             area_ratio   = area_ratio,
@@ -231,7 +234,7 @@ class DepthEstimator:
         if metrics is not None:
             SEV_COLOR = {"minor": (0, 255, 0), "moderate": (0, 165, 255), "severe": (0, 0, 255)}
             color = SEV_COLOR.get(metrics.severity, (255, 255, 255))
-            txt = (f"Depth:{metrics.depth_m:.2f}m  "
+            txt = (f"Drop:{metrics.depth_delta_m:.2f}m  "
                    f"Area:{metrics.area_m2:.3f}m2  "
                    f"[{metrics.severity.upper()}]")
             cv2.putText(out, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,

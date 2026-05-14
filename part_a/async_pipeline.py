@@ -7,7 +7,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, TextIO, Union
 
 import cv2
 import numpy as np
@@ -39,6 +39,7 @@ class AsyncPartAPipeline:
         yolo_path: str = SEG_POT_MODEL_PATH,
         depth_path: str = DEFAULT_DEPTH_MODEL_PATH,
         output: Optional[str] = None,
+        detections_output: Optional[str] = None,
         show: bool = False,
         max_frames: Optional[int] = None,
         queue_size: int = 2,
@@ -55,6 +56,7 @@ class AsyncPartAPipeline:
         self.yolo_path = yolo_path
         self.depth_path = depth_path
         self.output = output
+        self.detections_output = detections_output
         self.show = show
         self.max_frames = max_frames
         self.drop_old_frames = drop_old_frames
@@ -63,6 +65,8 @@ class AsyncPartAPipeline:
         self.timings: List[Phase2BTiming] = []
         self.frames_read = 0
         self.frames_dropped = 0
+        self.source_fps = 0.0
+        self._detections_fp: Optional[TextIO] = None
         self._stop = threading.Event()
         self._process = psutil.Process() if psutil is not None else None
 
@@ -82,24 +86,20 @@ class AsyncPartAPipeline:
         if not cap.isOpened():
             raise FileNotFoundError(f"Could not open video source: {self.source}")
 
+        self.source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         writer = self._make_writer(cap)
         try:
-            if self.process_all_frames:
-                self._run_sequential(cap, writer)
+            if self.detections_output:
+                detections_path = Path(self.detections_output)
+                detections_path.parent.mkdir(parents=True, exist_ok=True)
+                with detections_path.open("w", encoding="utf-8") as fp:
+                    self._detections_fp = fp
+                    self._run_with_mode(cap, writer)
             else:
-                capture_thread = threading.Thread(target=self._capture_loop, args=(cap,), daemon=True)
-                capture_thread.start()
-                try:
-                    while True:
-                        packet = self.frame_queue.get()
-                        if packet is None:
-                            break
-                        if not self._process_packet(packet, writer):
-                            break
-                finally:
-                    capture_thread.join(timeout=2.0)
+                self._run_with_mode(cap, writer)
         finally:
             self._stop.set()
+            self._detections_fp = None
             cap.release()
             if writer is not None:
                 writer.release()
@@ -113,6 +113,23 @@ class AsyncPartAPipeline:
             model_path=self.yolo_path,
             depth_model_path=self.depth_path,
         ).to_dict()
+
+    def _run_with_mode(self, cap: cv2.VideoCapture, writer: Optional[cv2.VideoWriter]) -> None:
+        if self.process_all_frames:
+            self._run_sequential(cap, writer)
+            return
+
+        capture_thread = threading.Thread(target=self._capture_loop, args=(cap,), daemon=True)
+        capture_thread.start()
+        try:
+            while True:
+                packet = self.frame_queue.get()
+                if packet is None:
+                    break
+                if not self._process_packet(packet, writer):
+                    break
+        finally:
+            capture_thread.join(timeout=2.0)
 
     def _run_sequential(self, cap: cv2.VideoCapture, writer: Optional[cv2.VideoWriter]) -> None:
         while not self._stop.is_set():
@@ -140,6 +157,8 @@ class AsyncPartAPipeline:
         if writer is not None:
             writer.write(result.frame)
 
+        self._write_detections(packet, result)
+
         if self.show:
             cv2.imshow("phase2b async pothole pipeline", result.frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -160,6 +179,43 @@ class AsyncPartAPipeline:
             )
         )
         return True
+
+    def _write_detections(self, packet: FramePacket, result) -> None:
+        if self._detections_fp is None:
+            return
+
+        frame_h, frame_w = packet.frame.shape[:2]
+        time_s = packet.index / self.source_fps if self.source_fps > 0 else None
+        for det_id, obs in enumerate(result.observations):
+            det = obs.detection
+            metrics = obs.metrics
+            record = {
+                "frame_index": int(packet.index),
+                "time_s": time_s,
+                "capture_ts": float(packet.capture_ts),
+                "detection_id": int(det_id),
+                "frame_width": int(frame_w),
+                "frame_height": int(frame_h),
+                "bbox_xyxy": [int(v) for v in det.bbox_xyxy],
+                "conf": float(det.conf),
+                "cls_id": int(det.cls_id),
+                "mask_area_px": int(det.area_px),
+                "area_m2": float(metrics.area_m2),
+                "area_ratio": float(metrics.area_ratio),
+                "depth_m": float(metrics.depth_m),
+                "depth_delta_m": float(metrics.depth_delta_m),
+                "depth_rel": float(metrics.depth_rel),
+                "severity": metrics.severity,
+                "severity_idx": int(metrics.severity_idx),
+                "centroid_xy_m": [
+                    float(metrics.centroid_xy[0]),
+                    float(metrics.centroid_xy[1]),
+                ],
+                "fps": float(result.fps),
+                "detect_ms": float(result.detect_ms),
+                "depth_ms": float(result.depth_ms),
+            }
+            self._detections_fp.write(json.dumps(record, ensure_ascii=True) + "\n")
 
     def _capture_loop(self, cap: cv2.VideoCapture) -> None:
         while not self._stop.is_set():
@@ -231,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 2B async Part A video pipeline")
     parser.add_argument("--source", required=True, help="Video path or webcam index, e.g. 0")
     parser.add_argument("--output", default=None, help="Optional output video path")
+    parser.add_argument("--detections", default=None, help="Optional JSONL path for per-detection depth/area records")
     parser.add_argument("--summary", default=None, help="Optional JSON summary path")
     parser.add_argument("--show", action="store_true", help="Show live preview")
     parser.add_argument("--max-frames", type=int, default=None)
@@ -269,6 +326,7 @@ def main() -> None:
         yolo_path=args.yolo,
         depth_path=args.depth,
         output=args.output,
+        detections_output=args.detections,
         show=args.show,
         max_frames=args.max_frames,
         queue_size=args.queue_size,
