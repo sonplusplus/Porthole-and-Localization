@@ -1,18 +1,25 @@
 import argparse
 import time
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 import cv2
 import numpy as np
-from .calibration import CameraParams, IPMTransformer, load_calibration_from_yaml
+from .calibration import CameraParams, IPMTransformer
+from .config import (
+    DEFAULT_DEPTH_MODEL_PATH,
+    SEG_POT_MODEL_PATH,
+    add_camera_args,
+    add_part_a_model_args,
+    load_camera_from_args,
+    placeholder_camera,
+    warn_placeholder_camera,
+)
 from .depth import DepthEstimator, PotholeMetrics
 from .detect import SegmentationResult, YOLOSegDetector
 
 
-SEG_POT_MODEL_PATH = "models/yolov8s_pothole.onnx"
-DEPTH_MODEL_PATH = "models/depth_anything_v2_vits.onnx"
+DEPTH_MODEL_PATH = DEFAULT_DEPTH_MODEL_PATH
 
 
 @dataclass
@@ -44,24 +51,13 @@ class PotholePipeline:
         severity_mode: str = "area_ratio",
     ):
         if cam is None:
-            warnings.warn(
+            warn_placeholder_camera(
                 "No CameraParams provided to PotholePipeline. Using placeholder values "
                 "(fx=800, fy=800, cx=640, cy=360, h_camera=1.2m, pitch=5deg). "
                 "Metric area_m2 and depth_m outputs will be unreliable for real cameras. "
-                "Pass --calib or construct CameraParams from measured camera specs.",
-                UserWarning,
-                stacklevel=2,
+                "Pass --calib or construct CameraParams from measured camera specs."
             )
-            self.cam = CameraParams(
-                fx=800,
-                fy=800,
-                cx=640,
-                cy=360,
-                width=1280,
-                height=720,
-                h_camera=1.2,
-                pitch=np.deg2rad(5),
-            )
+            self.cam = placeholder_camera()
         else:
             self.cam = cam
         self.ipm = IPMTransformer(self.cam)
@@ -212,23 +208,7 @@ def draw_label(
 
 
 def load_camera(args: argparse.Namespace) -> CameraParams:
-    if args.calib:
-        return load_calibration_from_yaml(args.calib)
-    warnings.warn(
-        "Running without --calib. Metric depth/area results are approximate only.",
-        UserWarning,
-        stacklevel=2,
-    )
-    return CameraParams(
-        fx=args.fx,
-        fy=args.fy,
-        cx=args.cx,
-        cy=args.cy,
-        width=args.width,
-        height=args.height,
-        h_camera=args.camera_height,
-        pitch=np.deg2rad(args.pitch_deg),
-    )
+    return load_camera_from_args(args)
 
 
 def run_image(pipeline: PotholePipeline, source: str, output: Optional[str]) -> None:
@@ -311,23 +291,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None, help="Output image/video path")
     parser.add_argument("--show", action="store_true", help="Show live window for video/webcam")
 
-    parser.add_argument("--yolo", default=SEG_POT_MODEL_PATH, help="Fine-tuned YOLOv8-seg .onnx/.pt")
-    parser.add_argument("--depth", default=DEPTH_MODEL_PATH, help="Depth Anything ONNX model")
-    parser.add_argument("--imgsz", type=int, default=448)
-    parser.add_argument("--conf", type=float, default=0.25)
-    parser.add_argument("--iou", type=float, default=0.45)
-    parser.add_argument("--depth-every-n", type=int, default=4, help="Run depth inference once every N processed frames")
-    parser.add_argument("--severity-mode", default="area_ratio", choices=["area_ratio", "area_m2"])
-
-    parser.add_argument("--calib", default=None, help="Optional camera calibration YAML")
-    parser.add_argument("--fx", type=float, default=800.0)
-    parser.add_argument("--fy", type=float, default=800.0)
-    parser.add_argument("--cx", type=float, default=640.0)
-    parser.add_argument("--cy", type=float, default=360.0)
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--camera-height", type=float, default=1.2)
-    parser.add_argument("--pitch-deg", type=float, default=5.0)
+    add_part_a_model_args(parser)
+    add_camera_args(parser)
     return parser.parse_args()
 
 

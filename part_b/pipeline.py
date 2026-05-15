@@ -2,9 +2,9 @@ import argparse
 import json
 import math
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .detector import Phase4LandmarkDetector
 from .dead_reckoning import WheelImuDeadReckoner, choose_motion_delta, integrate_body_delta
@@ -19,6 +19,16 @@ from .ocr import create_ocr_backend
 from .schema import DeltaPose, LaneEstimate, MotionSource, Phase3Output, Pose2D, ground_delta_from_points
 from .vo import OrbVisualOdometry
 from .handover import GpsHandoverManager, GpsLossSimulator
+
+
+@dataclass
+class LandmarkRuntimeStats:
+    observations: int = 0
+    matches: int = 0
+    corrections: int = 0
+    projected: int = 0
+    reprojection_rejected: int = 0
+    reprojection_errors: List[float] = field(default_factory=list)
 
 
 def run_sequence(
@@ -101,12 +111,7 @@ def run_sequence(
     lane_every_n = max(1, int(lane_every_n))
     landmark_every_n = max(1, int(landmark_every_n))
     last_lane: Optional[LaneEstimate] = None
-    landmark_observations = 0
-    landmark_matches = 0
-    landmark_corrections = 0
-    landmark_projected = 0
-    landmark_reprojection_rejected = 0
-    landmark_reprojection_errors = []
+    landmark_stats = LandmarkRuntimeStats()
     try:
         with out_path.open("w", encoding="utf-8") as f:
             for sample in seq.iter_samples(max_frames=max_frames):
@@ -164,14 +169,14 @@ def run_sequence(
                     motion_pose = integrate_body_delta(motion_pose, motion_delta)
                     pose = motion_pose
 
-                t0 = time.perf_counter()
-                if last_lane is None or count % lane_every_n == 0:
-                    lane = lane_detector.estimate(sample.frame)
-                    last_lane = lane
-                    lane_ms.append((time.perf_counter() - t0) * 1000.0)
-                else:
-                    lane = last_lane
-                    lane_ms.append(0.0)
+                lane, last_lane = _estimate_lane(
+                    lane_detector=lane_detector,
+                    frame=sample.frame,
+                    frame_count=count,
+                    every_n=lane_every_n,
+                    last_lane=last_lane,
+                    timings_ms=lane_ms,
+                )
 
                 t0 = time.perf_counter()
                 handover = handover_manager.update(
@@ -188,40 +193,22 @@ def run_sequence(
                     gps_noise_m=handover.gps_correction_noise_m,
                     gps_heading_rad=gps_heading_rad,
                 )
-                if landmark_db is not None and landmark_detector is not None and count % landmark_every_n == 0:
-                    detected_landmarks = landmark_detector.detect(
-                        frame=sample.frame,
-                        pose=fused_pose,
-                        sequence_id=seq.sequence_id,
-                        frame_index=sample.meta.frame_index,
-                        timestamp=sample.meta.timestamp,
-                    )
-                    landmark_observations += len(detected_landmarks)
-                    for obs in detected_landmarks:
-                        match = landmark_db.find_best_match(obs)
-                        if match is not None:
-                            landmark_matches += 1
-                            record = landmark_db.records[match.landmark_id]
-                            frame_h, frame_w = sample.frame.shape[:2]
-                            projection = project_landmark(
-                                record=record,
-                                pose=fused_pose,
-                                camera_fx=seq.camera_params.fx,
-                                camera_cx=seq.camera_params.cx,
-                                image_width=frame_w,
-                                image_height=frame_h,
-                            )
-                            if projection is not None:
-                                landmark_projected += 1
-                                error_px = reprojection_error_px(projection, obs.bbox_xyxy)
-                                landmark_reprojection_errors.append(error_px)
-                                if landmark_reprojection_gate_px > 0 and error_px > landmark_reprojection_gate_px:
-                                    landmark_reprojection_rejected += 1
-                                    landmark_db.upsert(obs)
-                                    continue
-                            fused_pose = ekf.correct_landmark(obs.p_3D, record.p_3D, match_score=match.score)
-                            landmark_corrections += 1
-                        landmark_db.upsert(obs)
+                fused_pose = _update_landmarks(
+                    landmark_db=landmark_db,
+                    landmark_detector=landmark_detector,
+                    ekf=ekf,
+                    frame=sample.frame,
+                    pose=fused_pose,
+                    sequence_id=seq.sequence_id,
+                    frame_index=sample.meta.frame_index,
+                    timestamp=sample.meta.timestamp,
+                    frame_count=count,
+                    every_n=landmark_every_n,
+                    reprojection_gate_px=landmark_reprojection_gate_px,
+                    camera_fx=seq.camera_params.fx,
+                    camera_cx=seq.camera_params.cx,
+                    stats=landmark_stats,
+                )
                 event_estimate = events.update(sample.meta.timestamp, fused_pose)
                 fusion_ms.append((time.perf_counter() - t0) * 1000.0)
 
@@ -269,11 +256,164 @@ def run_sequence(
     finally:
         seq.close()
 
+    summary = _build_run_summary(
+        sequence_id=seq.sequence_id,
+        frame_count=count,
+        output_path=out_path,
+        lane_backend=lane_backend,
+        lane_model=lane_model,
+        lane_dataset=lane_dataset,
+        lane_side_mode=lane_side_mode,
+        lane_every_n=lane_every_n,
+        landmark_db_path=landmark_db_path,
+        landmark_every_n=landmark_every_n,
+        landmark_reprojection_gate_px=landmark_reprojection_gate_px,
+        landmark_stats=landmark_stats,
+        gps_loss_enabled=gps_loss.enabled,
+        gps_loss_start=gps_loss_start,
+        gps_loss_end=gps_loss_end,
+        gps_loss_degraded_frames=gps_loss_degraded_frames,
+        gps_state_counts=gps_state_counts,
+        motion_source=motion_source,
+        motion_delta_source_counts=motion_delta_source_counts,
+        valid_motion=valid_motion,
+        vo_scale_source_counts=vo_scale_source_counts,
+        last_good_scale_hint=last_good_scale_hint,
+        handover_transitions=handover_transitions,
+        max_loss_error=max_loss_error,
+        relock_errors=relock_errors,
+        lane_counts=lane_counts,
+        valid_vo=valid_vo,
+        total_inliers=total_inliers,
+        u_turn_count=u_turn_count,
+        total_ms=total_ms,
+        vo_ms=vo_ms,
+        lane_ms=lane_ms,
+        fusion_ms=fusion_ms,
+    )
+    summary_path = out_path.with_suffix(out_path.suffix + ".summary.json")
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print(
+        f"Phase 3 baseline complete: sequence={seq.sequence_id}, "
+        f"frames={count}, output={out_path}, summary={summary_path}"
+    )
+
+
+def _estimate_lane(
+    lane_detector: Any,
+    frame: Any,
+    frame_count: int,
+    every_n: int,
+    last_lane: Optional[LaneEstimate],
+    timings_ms: List[float],
+) -> Tuple[LaneEstimate, LaneEstimate]:
+    t0 = time.perf_counter()
+    if last_lane is None or frame_count % every_n == 0:
+        lane = lane_detector.estimate(frame)
+        timings_ms.append((time.perf_counter() - t0) * 1000.0)
+        return lane, lane
+    timings_ms.append(0.0)
+    return last_lane, last_lane
+
+
+def _update_landmarks(
+    landmark_db: Optional[LandmarkDatabase],
+    landmark_detector: Optional[Phase4LandmarkDetector],
+    ekf: LocalizationEKF,
+    frame: Any,
+    pose: Pose2D,
+    sequence_id: str,
+    frame_index: int,
+    timestamp: float,
+    frame_count: int,
+    every_n: int,
+    reprojection_gate_px: float,
+    camera_fx: float,
+    camera_cx: float,
+    stats: LandmarkRuntimeStats,
+) -> Pose2D:
+    if landmark_db is None or landmark_detector is None or frame_count % every_n != 0:
+        return pose
+
+    detected_landmarks = landmark_detector.detect(
+        frame=frame,
+        pose=pose,
+        sequence_id=sequence_id,
+        frame_index=frame_index,
+        timestamp=timestamp,
+    )
+    stats.observations += len(detected_landmarks)
+
+    fused_pose = pose
+    for obs in detected_landmarks:
+        match = landmark_db.find_best_match(obs)
+        if match is not None:
+            stats.matches += 1
+            record = landmark_db.records[match.landmark_id]
+            frame_h, frame_w = frame.shape[:2]
+            projection = project_landmark(
+                record=record,
+                pose=fused_pose,
+                camera_fx=camera_fx,
+                camera_cx=camera_cx,
+                image_width=frame_w,
+                image_height=frame_h,
+            )
+            if projection is not None:
+                stats.projected += 1
+                error_px = reprojection_error_px(projection, obs.bbox_xyxy)
+                stats.reprojection_errors.append(error_px)
+                if reprojection_gate_px > 0 and error_px > reprojection_gate_px:
+                    stats.reprojection_rejected += 1
+                    landmark_db.upsert(obs)
+                    continue
+            fused_pose = ekf.correct_landmark(obs.p_3D, record.p_3D, match_score=match.score)
+            stats.corrections += 1
+        landmark_db.upsert(obs)
+    return fused_pose
+
+
+def _build_run_summary(
+    sequence_id: str,
+    frame_count: int,
+    output_path: Path,
+    lane_backend: str,
+    lane_model: str,
+    lane_dataset: str,
+    lane_side_mode: str,
+    lane_every_n: int,
+    landmark_db_path: Optional[str],
+    landmark_every_n: int,
+    landmark_reprojection_gate_px: float,
+    landmark_stats: LandmarkRuntimeStats,
+    gps_loss_enabled: bool,
+    gps_loss_start: Optional[int],
+    gps_loss_end: Optional[int],
+    gps_loss_degraded_frames: int,
+    gps_state_counts: Dict[str, int],
+    motion_source: MotionSource,
+    motion_delta_source_counts: Dict[str, int],
+    valid_motion: int,
+    vo_scale_source_counts: Dict[str, int],
+    last_good_scale_hint: float,
+    handover_transitions: Dict[str, int],
+    max_loss_error: float,
+    relock_errors: List[float],
+    lane_counts: Dict[str, int],
+    valid_vo: int,
+    total_inliers: int,
+    u_turn_count: int,
+    total_ms: List[float],
+    vo_ms: List[float],
+    lane_ms: List[float],
+    fusion_ms: List[float],
+) -> Dict[str, Any]:
     avg_total_ms = _mean(total_ms)
-    summary = {
-        "sequence": seq.sequence_id,
-        "frames": count,
-        "output": str(out_path),
+    return {
+        "sequence": sequence_id,
+        "frames": frame_count,
+        "output": str(output_path),
         "lane_backend": lane_backend,
         "lane_model": lane_model,
         "lane_dataset": lane_dataset,
@@ -283,20 +423,20 @@ def run_sequence(
             "enabled": landmark_db_path is not None,
             "db_path": landmark_db_path,
             "every_n": landmark_every_n,
-            "observations": landmark_observations,
-            "matches": landmark_matches,
-            "corrections": landmark_corrections,
+            "observations": landmark_stats.observations,
+            "matches": landmark_stats.matches,
+            "corrections": landmark_stats.corrections,
             "ghost_projection": {
-                "projected": landmark_projected,
-                "rejected_by_gate": landmark_reprojection_rejected,
+                "projected": landmark_stats.projected,
+                "rejected_by_gate": landmark_stats.reprojection_rejected,
                 "gate_px": landmark_reprojection_gate_px,
-                "avg_reprojection_error_px": _mean(landmark_reprojection_errors),
-                "p95_reprojection_error_px": _percentile(landmark_reprojection_errors, 0.95),
+                "avg_reprojection_error_px": _mean(landmark_stats.reprojection_errors),
+                "p95_reprojection_error_px": _percentile(landmark_stats.reprojection_errors, 0.95),
             },
         },
         "gps_state_counts": gps_state_counts,
         "gps_loss_simulation": {
-            "enabled": gps_loss.enabled,
+            "enabled": gps_loss_enabled,
             "start_frame": gps_loss_start,
             "end_frame": gps_loss_end,
             "degraded_frames": gps_loss_degraded_frames,
@@ -338,13 +478,6 @@ def run_sequence(
         },
         "estimated_processing_fps": (1000.0 / avg_total_ms) if avg_total_ms > 0 else 0.0,
     }
-    summary_path = out_path.with_suffix(out_path.suffix + ".summary.json")
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    print(
-        f"Phase 3 baseline complete: sequence={seq.sequence_id}, "
-        f"frames={count}, output={out_path}, summary={summary_path}"
-    )
 
 
 def resolve_sequence(args: argparse.Namespace):

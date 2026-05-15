@@ -54,15 +54,18 @@ class PaddleOcrBackend(OcrBackend):
 class NullOcrBackend(OcrBackend):
     name = "none"
 
-    def __init__(self, lang: str = "vi") -> None:
+    def __init__(self, lang: str = "vi", reason: Optional[str] = None) -> None:
         self.lang = lang
+        self.reason = reason
 
     def recognize(self, image_bgr: np.ndarray) -> Optional[OcrResult]:
         return None
 
 
-def create_ocr_backend(lang: str = "vi") -> OcrBackend:
+def create_ocr_backend(lang: str = "vi", strict: bool = False) -> OcrBackend:
     try:
         return PaddleOcrBackend(lang=lang)
-    except ImportError:
-        return NullOcrBackend(lang=lang)
+    except Exception as exc:
+        if strict:
+            raise
+        return NullOcrBackend(lang=lang, reason=str(exc))

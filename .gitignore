@@ -6,7 +6,8 @@ update.md
 /models
 /data
 bugs.md
-report.md
+Technical-Report.md
 /__pycache__
 __pycache__/
 *.py[cod]
+

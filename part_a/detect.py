@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from .config import SEG_POT_MODEL_PATH
+
 
 @dataclass
 class SegmentationResult:
@@ -23,7 +25,7 @@ class SegmentationResult:
 class YOLOSegDetector:
     def __init__(
         self,
-        model_path: str = "models/yolov8s_pothole.onnx",
+        model_path: str = SEG_POT_MODEL_PATH,
         imgsz: int = 448,
         conf: float = 0.25,
         iou: float = 0.45,
