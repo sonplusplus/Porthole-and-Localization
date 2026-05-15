@@ -150,13 +150,13 @@ Trong các command dưới đây, có thể dùng `python` nếu môi trường 
 Setup môi trường ảo (virtual env)
 ```powershell
 python -m venv myenv
-myenv\Scripts\python.exe -m pip install --upgrade pip
-myenv\Scripts\python.exe -m pip install -r requirements.txt
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 Run test
 ```powershell
-myenv\Scripts\python.exe -B scripts\runtime_doctor.py
-myenv\Scripts\python.exe -B scripts\smoketest_p0.py
+py -B scripts\runtime_doctor.py
+py -B scripts\smoketest_p0.py
 ```
 
 ### 4.2 Unit Test
